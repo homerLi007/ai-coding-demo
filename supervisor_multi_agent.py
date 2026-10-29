@@ -20,7 +20,7 @@ class SupervisorState(TypedDict):
 # ==========================================
 # 2. Initialize DeepSeek LLM Client
 # ==========================================
-DEEPSEEK_API_KEY = "REMOVED_DEEPSEEK_KEY"  # <--- Replace with your actual key
+DEEPSEEK_API_KEY = ""  # <--- Replace with your actual key
 
 llm = ChatOpenAI(
     model="deepseek-chat",

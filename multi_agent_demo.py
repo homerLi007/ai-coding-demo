@@ -20,7 +20,7 @@ class MultiAgentState(TypedDict):
 # 2. Initialize DeepSeek LLM Client
 # ==========================================
 # Replace with your actual DeepSeek API key
-DEEPSEEK_API_KEY = "REMOVED_DEEPSEEK_KEY"
+DEEPSEEK_API_KEY = ""
 
 llm = ChatOpenAI(
     model="deepseek-chat",

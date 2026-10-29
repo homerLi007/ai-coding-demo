@@ -1,6 +1,6 @@
 from github import Github, Auth
 
-g = Github(auth=Auth.Token("REMOVED_GITHUB_TOKEN"))
+g = Github(auth=Auth.Token(""))
 repo = g.get_repo("homerLi007/ai-coding-demo")
 
 # 尝试创建一个测试分支

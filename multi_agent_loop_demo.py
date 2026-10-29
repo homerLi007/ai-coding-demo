@@ -7,7 +7,7 @@ from langgraph.graph import StateGraph, START, END
 import operator
 from github import Github, InputGitAuthor
 
-os.environ["GITHUB_TOKEN"] = "REMOVED_GITHUB_TOKEN"
+os.environ["GITHUB_TOKEN"] = ""
 # ==========================================
 # 1. Define the Shared State
 # ==========================================
@@ -27,7 +27,7 @@ class CodeAgentState(TypedDict):
 # ==========================================
 # 2. Initialize DeepSeek LLM Client
 # ==========================================
-DEEPSEEK_API_KEY = "REMOVED_DEEPSEEK_KEY"  # <--- Replace with your actual key
+DEEPSEEK_API_KEY = ""  # <--- Replace with your actual key
 
 llm = ChatOpenAI(
     model="deepseek-chat",

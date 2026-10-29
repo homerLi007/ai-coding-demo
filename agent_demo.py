@@ -37,7 +37,7 @@ class AgentState(TypedDict):
 model = ChatOpenAI(
     model="deepseek-chat",
     base_url="https://api.deepseek.com",
-    api_key="REMOVED_DEEPSEEK_KEY",  # Make sure to set DEEPSEEK_API_KEY in your environment
+    api_key="",  # Make sure to set DEEPSEEK_API_KEY in your environment
     temperature=0
 ).bind_tools(tools)
 
