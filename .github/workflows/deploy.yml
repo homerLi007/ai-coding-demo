@@ -38,19 +38,23 @@ jobs:
       # ── 3. 构建并推送镜像（不依赖 docker/build-push-action）──
       - name: Build and push image
         run: |
-          IMAGE="${REGISTRY}/${IMAGE_NAME}:${GITHUB_SHA}"
-          IMAGE_LATEST="${REGISTRY}/${IMAGE_NAME}:latest"
-          echo "Building ${IMAGE}"
-          docker build -t "${IMAGE}" -t "${IMAGE_LATEST}" .
-          docker push "${IMAGE}"
-          docker push "${IMAGE_LATEST}"
+          # Docker 镜像名必须全小写，而 github.repository 可能含大写
+           IMAGE_NAME_LOWER="${IMAGE_NAME,,}"
+           IMAGE="${REGISTRY}/${IMAGE_NAME_LOWER}:${GITHUB_SHA}"
+           IMAGE_LATEST="${REGISTRY}/${IMAGE_NAME_LOWER}:latest"
+           echo "Building ${IMAGE}"
+           docker build -t "${IMAGE}" -t "${IMAGE_LATEST}" .
+           docker push "${IMAGE}"
+           docker push "${IMAGE_LATEST}"
 
       # ── 4. 部署到 K3s ──
       - name: Deploy to K3s
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
         run: |
-          sed -i "s|image:.*|image: ${IMAGE}|" k8s/deployment.yaml
+          # 同样转小写
+          IMAGE_LOWER="${IMAGE,,}"
+          sed -i "s|image:.*|image: ${IMAGE_LOWER}|" k8s/deployment.yaml
           kubectl apply -f k8s/
           kubectl rollout status deployment/ai-coding-demo -n default --timeout=180s
           kubectl get pods -l app=ai-coding-demo -n default -o wide
