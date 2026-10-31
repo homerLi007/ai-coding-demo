@@ -1,0 +1,2 @@
+cd ai-coding-demo
+pip freeze | grep -Ei "fastapi|uvicorn|langchain|langgraph|pydantic|python-dotenv|PyGithub|openai" > backend/requirements.txt

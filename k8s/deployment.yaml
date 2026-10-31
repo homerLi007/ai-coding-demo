@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-coding-demo
+  namespace: default
+  labels:
+    app: ai-coding-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ai-coding-demo
+  template:
+    metadata:
+      labels:
+        app: ai-coding-demo
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/homerli007/ai-coding-demo:latest  # ← CI 会覆盖
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: ai-coding-demo-secrets
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      imagePullSecrets:
+        - name: ghcr-secret
