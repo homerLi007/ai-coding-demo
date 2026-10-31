@@ -1,0 +1,16 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-coding-demo-ingress
+  namespace: default
+spec:
+  rules:
+    - http:                          # ← 不写 host，匹配任意 host
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ai-coding-demo-service
+                port:
+                  number: 80
