@@ -22,12 +22,19 @@ jobs:
       - name: Checkout
         run: |
           cd "$GITHUB_WORKSPACE"
-          # 清理工作目录
-          find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-          # 浅克隆当前 commit
-          git clone --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" .
-          git fetch --depth 1 origin "${GITHUB_SHA}"
-          git checkout "${GITHUB_SHA}"
+          if [ -d .git ]; then
+            echo "Incremental fetch"
+            git remote set-url origin "git@github.com:${GITHUB_REPOSITORY}.git"
+            git fetch --depth 1 origin "${GITHUB_SHA}"
+            git reset --hard FETCH_HEAD
+            git clean -fdx -e .env
+          else
+            echo "Fresh clone"
+            find . -mindepth 1 -maxdepth 1 ! -name '.env' -exec rm -rf {} + 2>/dev/null || true
+            git clone --depth 1 "git@github.com:${GITHUB_REPOSITORY}.git" .
+            git fetch --depth 1 origin "${GITHUB_SHA}"
+            git checkout "${GITHUB_SHA}"
+          fi
 
       # ── 2. 登录 GHCR（不依赖 docker/login-action）──
       - name: Log in to GHCR
