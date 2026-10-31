@@ -57,6 +57,7 @@ jobs:
       # ── 4. 部署到 K3s ──
       - name: Deploy to K3s
         env:
+          KUBECONFIG: /home/forrestli/.kube/config
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
         run: |
           # 同样转小写
