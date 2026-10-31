@@ -10,7 +10,12 @@ app = FastAPI(title="Multi-Agent API", version="0.1.0")
 # 允许 React 开发服务器跨域
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8080",       # ← 加这行，兼容 port-forward
+        "http://127.0.0.1:8080",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
