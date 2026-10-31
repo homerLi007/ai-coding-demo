@@ -7,7 +7,9 @@ from langgraph.graph import StateGraph, START, END
 import operator
 from github import Github, InputGitAuthor
 
-os.environ["GITHUB_TOKEN"] = ""
+from dotenv import load_dotenv
+
+load_dotenv()
 # ==========================================
 # 1. Define the Shared State
 # ==========================================
@@ -27,7 +29,7 @@ class CodeAgentState(TypedDict):
 # ==========================================
 # 2. Initialize DeepSeek LLM Client
 # ==========================================
-DEEPSEEK_API_KEY = ""  # <--- Replace with your actual key
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 
 llm = ChatOpenAI(
     model="deepseek-chat",
@@ -147,10 +149,18 @@ def github_commit_node(state: CodeAgentState):
     base_branch = repo.get_branch(state["github_base_branch"])
     new_branch_name = f"ai-agent/iter-{state['iteration_count']}"
 
-    repo.create_git_ref(
-        ref=f"refs/heads/{new_branch_name}",
-        sha=base_branch.commit.sha
-    )
+    try:
+        repo.create_git_ref(
+            ref=f"refs/heads/{new_branch_name}",
+            sha=base_branch.commit.sha
+        )
+        print(f"✅ 已创建分支 {new_branch_name}")
+    except GithubException as e:
+        if e.status == 422:
+            print(f"⚠️ 分支 {new_branch_name} 已存在，直接复用")
+        else:
+            print(f"❌ 创建分支失败 -> status={e.status}, data={e.data}")
+            raise
 
     # 2. 在新分支上创建文件（或更新已有文件）
     file_path = state["github_file_path"]
@@ -163,7 +173,7 @@ def github_commit_node(state: CodeAgentState):
             content=state["code"],
             sha=existing.sha,
             branch=new_branch_name
-        )[reference:3]
+        )
     except Exception:
         # 文件不存在则创建
         repo.create_file(
@@ -171,7 +181,7 @@ def github_commit_node(state: CodeAgentState):
             message=f"AI Agent: add {file_path} (iteration {state['iteration_count']})",
             content=state["code"],
             branch=new_branch_name
-        )[reference:4]
+        )
 
     # 3. 创建 Pull Request
     pr = repo.create_pull(
@@ -179,7 +189,7 @@ def github_commit_node(state: CodeAgentState):
         body=f"由 LangGraph 多智能体循环自动生成。\n\n任务: {state['task']}",
         head=new_branch_name,
         base=state["github_base_branch"]
-    )[reference:5]
+    )
 
     print(f"✅ PR 已创建: {pr.html_url}")
 

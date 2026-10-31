@@ -6,6 +6,9 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 import operator
 
+from dotenv import load_dotenv
+
+load_dotenv()
 # ==========================================
 # 1. Define the Shared State
 # ==========================================
@@ -20,7 +23,7 @@ class MultiAgentState(TypedDict):
 # 2. Initialize DeepSeek LLM Client
 # ==========================================
 # Replace with your actual DeepSeek API key
-DEEPSEEK_API_KEY = ""
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 
 llm = ChatOpenAI(
     model="deepseek-chat",
