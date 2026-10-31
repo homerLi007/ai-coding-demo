@@ -1,6 +1,10 @@
 # ---------- 阶段 1：构建前端 ----------
 FROM node:20-alpine AS frontend-builder
 WORKDIR /frontend
+
+# ← 加这一行：npm 走国内镜像
+RUN npm config set registry https://registry.npmmirror.com
+
 COPY frontend/package*.json ./
 RUN npm ci
 COPY frontend/ ./
