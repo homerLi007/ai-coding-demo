@@ -1,48 +1,53 @@
 import os
 import json
+import re
 from typing import Annotated, TypedDict, Sequence, Literal
+import operator
+from datetime import datetime
+
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
-import operator
 from dotenv import load_dotenv
 from github import Github, Auth, GithubException
-from datetime import datetime
-import re
 
 load_dotenv()
 
-import os
+
+# ==========================================
+# 0. 多文件项目的辅助函数与 Prompt 常量
+# ==========================================
 
 _ALLOWED_EXTS = {
     ".java", ".kt", ".gradle", ".xml", ".properties", ".yml", ".yaml",
     ".js", ".jsx", ".ts", ".tsx", ".json", ".html", ".css",
-    ".py", ".md", ".txt", ".gitignore",
+    ".py", ".md", ".txt",
 }
+
+# 无扩展名但合法、必须保留原名的文件
+_NO_EXT_WHITELIST = {
+    "dockerfile", "makefile", ".gitignore", ".dockerignore",
+    ".npmrc", ".env.example", ".editorconfig",
+}
+
 
 def sanitize_filename(name: str) -> str:
     """把 LLM 返回的相对路径清洗成安全的、仓库内可用的路径。
-    - 拒绝绝对路径、..、NUL
+
+    - 拒绝绝对路径、`..`、NUL
     - 保留子目录（Spring Boot 的 src/main/java/... 需要保留）
-    - 保留合法扩展名；无扩展名的按 .txt 处理
+    - 保留合法扩展名；无扩展名的补 `.txt`（白名单除外）
     """
     if not name or not isinstance(name, str):
         return "README.md"
 
-    # 统一分隔符，转成 POSIX 风格
-    name = name.replace("\\", "/").strip()
-    if name.startswith("/"):
-        name = name.lstrip("/")
+    name = name.replace("\\", "/").strip().lstrip("/")
 
-    # 过滤危险段
     parts = []
     for p in name.split("/"):
         p = p.strip()
-        if p in ("", ".", ".."):
+        if p in ("", ".", "..") or "\x00" in p:
             continue
-        if "\x00" in p:
-            continue
-        # 过滤非法字符（保留字母数字、_-、点）
         p = re.sub(r"[^A-Za-z0-9_\-.]", "_", p)
         if p:
             parts.append(p)
@@ -50,14 +55,114 @@ def sanitize_filename(name: str) -> str:
     if not parts:
         return "README.md"
 
-    # 检查扩展名
     base = parts[-1]
-    root, ext = os.path.splitext(base)
-    if ext.lower() not in _ALLOWED_EXTS:
-        # 无合法扩展名 → 当作 .txt
-        parts[-1] = base + ".txt"
+    if base.lower() not in _NO_EXT_WHITELIST:
+        _, ext = os.path.splitext(base)
+        if ext.lower() not in _ALLOWED_EXTS:
+            parts[-1] = base + ".txt"
 
     return "/".join(parts)
+
+
+def _format_files_for_prompt(files: dict, max_chars: int = 12000) -> str:
+    """把多文件拼成给 LLM 的展示格式，超长则逐文件截断。"""
+    if not files:
+        return "(no files yet)"
+    out = []
+    used = 0
+    for path in sorted(files.keys()):
+        content = files[path] or ""
+        block = f"### {path}\n```\n{content}\n```\n"
+        if used + len(block) > max_chars:
+            out.append(
+                f"### {path}\n(truncated — assume unchanged unless "
+                f"a listed issue targets it)\n"
+            )
+            continue
+        out.append(block)
+        used += len(block)
+    return "\n".join(out)
+
+
+INITIAL_PROMPT = """You are a senior full-stack engineer. Generate a small but complete
+**Spring Boot backend + React frontend** project for the task below.
+
+## Task
+{task}
+
+## Output requirements
+Return a JSON object with THREE fields:
+- "files": {{ "<relative path>": "<file content>", ... }}
+- "changes": "1 sentence describing what you built"
+- "notes": "optional, known limitations"
+
+## File layout (use EXACTLY these paths)
+Generate these files at minimum:
+
+backend/pom.xml
+backend/src/main/java/com/example/demo/DemoApplication.java
+backend/src/main/java/com/example/demo/controller/ApiController.java
+backend/src/main/resources/application.properties
+frontend/package.json
+frontend/vite.config.js
+frontend/index.html
+frontend/src/main.jsx
+frontend/src/App.jsx
+frontend/src/App.css
+
+## Rules
+1. Spring Boot 3.x, Java 17, Maven. Use `spring-boot-starter-parent` to manage
+   dependency versions — do NOT hardcode dependency versions.
+2. Exactly ONE `@RestController` with at least one endpoint that satisfies the
+   task. No database, no auth, no Spring Security.
+3. React 18 + Vite + plain JavaScript (no TypeScript). App.jsx calls the backend
+   via `fetch('/api/...')` — relative path, same-origin in production.
+4. Keep each file SHORT (under 120 lines). Do not add extra features, extra
+   controllers, or extra React components.
+5. Do not invent endpoints the React code does not call; do not call endpoints
+   the backend does not expose.
+6. Return ONLY valid JSON. No markdown fences, no prose before/after.
+"""
+
+
+FIX_PROMPT = """You are a senior full-stack engineer fixing security issues in an
+existing **Spring Boot + React** project.
+
+## Task
+{task}
+
+## Current project files
+{files_block}
+
+## Security issues that MUST be fixed (only these)
+{issues_block}
+
+## Rules
+1. MINIMAL DIFF: keep existing structure, package names, file paths. Edit only
+   what the listed issues require.
+2. DO NOT rewrite the whole project. If a file is not related to a listed issue,
+   do not touch it.
+3. If an issue is about a specific file, keep the fix local to that file.
+4. Do not add dependencies to pom.xml or package.json unless a listed issue
+   explicitly requires it.
+5. Do not add logging, comments, or documentation that is not required by the
+   issue.
+6. If an issue is genuinely [INHERENT], add a code comment
+   `// KNOWN LIMITATION: ...` (Java) or `// KNOWN LIMITATION: ...` (JS) and
+   note it in `notes`.
+7. Return ONLY valid JSON, no markdown fences.
+
+## Return format
+{{
+  "files": {{ "<path>": "<updated content>", ... }},
+  "changes": "1-2 sentences",
+  "notes": "optional"
+}}
+
+Only include files that actually changed. Files not listed in `files` will be
+kept as-is.
+"""
+
 
 # ==========================================
 # 1. Define Advanced State
@@ -65,9 +170,9 @@ def sanitize_filename(name: str) -> str:
 class SupervisorState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     task: str
-    next_agent: str          # Managed by supervisor: "coder", "security", "writer", or "FINISH"
-    code: str
-    files: dict[str, str]
+    next_agent: str
+    code: str                       # 主文件内容（兼容旧逻辑 / supervisor 判断"是否已生成"）
+    files: dict[str, str]           # {相对路径: 文件内容}
     security_report: str
     needs_fix: bool
     fix_attempts: int
@@ -79,27 +184,6 @@ class SupervisorState(TypedDict):
     github_code_path: str
     github_pr_url: str
 
-def sanitize_py_filename(name: str) -> str:
-    """把 LLM 返回的文件名清洗成合法的、单层的 .py 文件名。"""
-    if not name:
-        return "solution.py"
-
-    # 只取最后一段，防止 ../ 路径穿越
-    name = name.replace("\\", "/").split("/")[-1].strip()
-
-    # 去掉扩展名，统一小写、空格转下划线，只保留字母数字下划线
-    name = re.sub(r"\.py$", "", name, flags=re.IGNORECASE)
-    name = re.sub(r"\s+", "_", name)
-    name = re.sub(r"[^A-Za-z0-9_]", "", name)
-
-    if not name:
-        return "solution.py"
-
-    # Python 标识符不能以数字开头
-    if name[0].isdigit():
-        name = f"module_{name}"
-
-    return f"{name.lower()}.py"
 
 def _extract_top_issues(report: str, max_issues: int = 3) -> list[str]:
     """只提取 CRITICAL / HIGH 级别的 [FIXABLE] 条目。"""
@@ -114,12 +198,13 @@ def _extract_top_issues(report: str, max_issues: int = 3) -> list[str]:
         m = re.search(r"\*\*Severity:\*\*\s*(CRITICAL|HIGH|MEDIUM|LOW)", b, re.I)
         sev = m.group(1).upper() if m else "MEDIUM"
         if sev not in ("CRITICAL", "HIGH"):
-            continue                                  # ← 只保留 CRITICAL/HIGH
+            continue
         body = b.strip()
         parsed.append((order.get(sev, 99), f"### {body[:1200]}"))
 
     parsed.sort(key=lambda x: x[0])
     return [p[1] for p in parsed[:max_issues]]
+
 
 # ==========================================
 # 2. Initialize DeepSeek LLM Client
@@ -130,16 +215,16 @@ llm = ChatOpenAI(
     model="deepseek-chat",
     base_url="https://api.deepseek.com",
     api_key=DEEPSEEK_API_KEY,
-    temperature=0.3
+    temperature=0.3,
 )
 
-# 修复专用低温实例（避免 llm.bind 的兼容问题）
 llm_fix = ChatOpenAI(
     model="deepseek-chat",
     base_url="https://api.deepseek.com",
     api_key=DEEPSEEK_API_KEY,
     temperature=0.1,
 )
+
 
 # ==========================================
 # 3. Define Specialized Worker Nodes
@@ -179,13 +264,11 @@ def coder_node(state: SupervisorState):
             changes = payload.get("changes", "")
             notes = payload.get("notes", "")
         except json.JSONDecodeError:
-            print("⚠️ Coder 未返回合法 JSON，尝试从 markdown 兜底解析")
-            # 简单兜底：把整段当单文件
+            print("⚠️ Coder 未返回合法 JSON，兜底为单文件 README.md")
             raw_files = {"README.md": content}
             changes = "(fallback)"
             notes = ""
 
-        # 清洗路径 + 合并
         cleaned: dict[str, str] = {}
         for raw_path, file_content in raw_files.items():
             if not isinstance(file_content, str):
@@ -198,14 +281,17 @@ def coder_node(state: SupervisorState):
 
         if is_fixing:
             merged = dict(previous_files)
-            merged.update(cleaned)          # 只覆盖返回的文件
+            merged.update(cleaned)
         else:
             merged = cleaned
 
-        # 主文件（用于 supervisor 判断"是否已生成"，也用于 code 字段兼容）
+        # 主文件：优先 DemoApplication.java，其次 pom.xml，最后随便一个
         primary = next(
-            (p for p in merged if p.endswith(("DemoApplication.java", "pom.xml"))),
-            next(iter(merged)),
+            (p for p in merged if p.endswith("DemoApplication.java")),
+            next(
+                (p for p in merged if p.endswith("pom.xml")),
+                next(iter(merged)),
+            ),
         )
         primary_content = merged[primary]
 
@@ -216,23 +302,25 @@ def coder_node(state: SupervisorState):
         if notes:
             print(f"⚠️ 已知局限: {notes}")
 
-        # 检测"无变化"
         if is_fixing and cleaned == {k: previous_files.get(k) for k in cleaned}:
             print("⚠️ 修复后文件无变化，强制放行")
 
         return {
             "files": merged,
-            "code": primary_content,          # 兼容旧字段
+            "code": primary_content,
             "github_code_path": primary,
             "security_report": "",
             "needs_fix": False,
             "fix_attempts": fix_attempts + (1 if is_fixing else 0),
-            "messages": [AIMessage(content=f"Coder: {len(merged)} files, {changes}")],
+            "messages": [
+                AIMessage(content=f"Coder: {len(merged)} files, {changes}")
+            ],
         }
 
     except Exception as exc:
         print(f"❌ Coder 异常: {type(exc).__name__}: {exc}")
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return {
             "files": previous_files,
             "code": state.get("code", ""),
@@ -243,28 +331,6 @@ def coder_node(state: SupervisorState):
             "messages": [AIMessage(content=f"Coder error: {exc}")],
         }
 
-        return {
-            "code": code,
-            "github_code_path": filename,
-            "security_report": "",
-            "needs_fix": False,              # ← 清空，重新审计
-            "fix_attempts": fix_attempts + (1 if is_fixing else 0),
-            "messages": [AIMessage(content=f"Coder produced {filename}: {changes}")],
-        }
-
-    except Exception as exc:
-        # 任何异常都不能让 coder 死循环——打印出来 + 强制放行
-        print(f"❌ Coder 异常: {type(exc).__name__}: {exc}")
-        import traceback
-        traceback.print_exc()
-        return {
-            "code": previous_code,           # 保留旧代码
-            "github_code_path": previous_filename or "solution.py",
-            "security_report": "",
-            "needs_fix": False,              # 强制放行，交给 writer/github
-            "fix_attempts": fix_attempts + (1 if is_fixing else 0),
-            "messages": [AIMessage(content=f"Coder error: {exc}")],
-        }
 
 def security_node(state: SupervisorState):
     print("\n🔒 [Security Auditor]: Auditing Spring Boot + React project...")
@@ -318,7 +384,10 @@ For every finding, prefix with [FIXABLE] / [INHERENT] / [INFO].
         print(f"🚨 {severity} 已修 {fix_attempts} 次仍未通过，强制放行")
         needs_fix = False
 
-    print(f"🛡️ Severity: {severity}, needs_fix: {needs_fix}, fix_attempts: {fix_attempts}")
+    print(
+        f"🛡️ Severity: {severity}, needs_fix: {needs_fix}, "
+        f"fix_attempts: {fix_attempts}"
+    )
     print(f"🛡️ Security Report:\n{content}")
 
     return {
@@ -326,6 +395,7 @@ For every finding, prefix with [FIXABLE] / [INHERENT] / [INFO].
         "needs_fix": needs_fix,
         "messages": [AIMessage(content=f"Security Audit ({severity})")],
     }
+
 
 def writer_node(state: SupervisorState):
     print("\n📝 [Doc Writer]: Generating README...")
@@ -341,7 +411,8 @@ def writer_node(state: SupervisorState):
 - Start with `# <project name>` (derive from pom.xml artifactId or task)
 - `## Stack` — one line: Spring Boot 3.x / Java 17 / React 18 / Vite
 - `## Layout` — tree of the top-level directories
-- `## How to run` — backend: `cd backend && mvn spring-boot:run`; frontend: `cd frontend && npm install && npm run dev`
+- `## How to run` — backend: `cd backend && mvn spring-boot:run`;
+  frontend: `cd frontend && npm install && npm run dev`
 - `## API` — list endpoints from the controller
 - `## Notes` — any known limitations
 
@@ -350,7 +421,6 @@ Return ONLY the raw README.md content. Do NOT wrap in a code fence.
     response = llm.invoke([HumanMessage(content=prompt)])
     doc = response.content.strip()
 
-    # 兜底：剥掉可能的代码围栏
     if doc.startswith("```"):
         doc = re.sub(r"^```(?:markdown|md)?\s*", "", doc)
         doc = re.sub(r"\s*```$", "", doc)
@@ -360,6 +430,7 @@ Return ONLY the raw README.md content. Do NOT wrap in a code fence.
         "documentation": doc,
         "messages": [AIMessage(content="Documentation generated")],
     }
+
 
 # ==========================================
 # 4. The Supervisor Node (The Router Brain)
@@ -388,7 +459,6 @@ def supervisor_node(state: SupervisorState):
     return {"next_agent": next_agent, "iteration_count": iteration}
 
 
-
 def github_commit_node(state: SupervisorState):
     print("\n🐙 [GitHub Agent]: 提交项目到仓库...")
     token = os.environ.get("GITHUB_TOKEN")
@@ -406,7 +476,6 @@ def github_commit_node(state: SupervisorState):
         if e.status != 422:
             raise
 
-    # 组装所有要提交的文件
     files = dict(state.get("files", {}) or {})
     files["README.md"] = state.get("documentation", "") or "# Generated by AI Agent"
 
@@ -414,65 +483,84 @@ def github_commit_node(state: SupervisorState):
         try:
             existing = repo.get_contents(path, ref=new_branch)
             repo.update_file(
-                path=path, message=f"AI Agent: update {path}",
-                content=content or "", sha=existing.sha, branch=new_branch,
+                path=path,
+                message=f"AI Agent: update {path}",
+                content=content or "",
+                sha=existing.sha,
+                branch=new_branch,
             )
         except GithubException:
             repo.create_file(
-                path=path, message=f"AI Agent: add {path}",
-                content=content or "", branch=new_branch,
+                path=path,
+                message=f"AI Agent: add {path}",
+                content=content or "",
+                branch=new_branch,
             )
         print(f"   📄 已提交 {path}")
 
     try:
         pr = repo.create_pull(
             title=f"AI Agent: {state['task'][:60]}",
-            body=f"**任务**: {state['task']}\n\n**安全审计**:\n{state.get('security_report', 'N/A')}",
-            head=new_branch, base=state["github_base_branch"],
+            body=(
+                f"**任务**: {state['task']}\n\n"
+                f"**安全审计**:\n{state.get('security_report', 'N/A')}"
+            ),
+            head=new_branch,
+            base=state["github_base_branch"],
         )
         pr_url = pr.html_url
     except GithubException as e:
         if e.status == 422:
             pr_url = next(
-                (p.html_url for p in repo.get_pulls(
-                    state="open", head=f"{repo.owner.login}:{new_branch}")), "")
+                (
+                    p.html_url
+                    for p in repo.get_pulls(
+                    state="open",
+                    head=f"{repo.owner.login}:{new_branch}",
+                )
+                ),
+                "",
+            )
         else:
             raise
 
     print(f"✅ PR: {pr_url}")
-    return {"github_pr_url": pr_url, "messages": [AIMessage(content=f"PR: {pr_url}")]}
+    return {
+        "github_pr_url": pr_url,
+        "messages": [AIMessage(content=f"PR: {pr_url}")],
+    }
+
 
 # ==========================================
 # 5. Define Conditional Routing Edge
 # ==========================================
-def route_next(state: SupervisorState) -> Literal["coder", "security", "writer", "github", "END"]:
+def route_next(
+        state: SupervisorState,
+) -> Literal["coder", "security", "writer", "github", "END"]:
     next_agent = state["next_agent"]
     if next_agent in ("coder", "security", "writer", "github"):
         return next_agent
     return "END"
+
 
 # ==========================================
 # 6. Assemble the Supervisor Graph
 # ==========================================
 workflow = StateGraph(SupervisorState)
 
-# Add all worker nodes and supervisor node
 workflow.add_node("supervisor", supervisor_node)
 workflow.add_node("coder", coder_node)
 workflow.add_node("security", security_node)
 workflow.add_node("writer", writer_node)
 workflow.add_node("github", github_commit_node)
 
-# Set entry point to supervisor
 workflow.set_entry_point("supervisor")
 
-# From workers, always return back to the supervisor to coordinate the next step
 workflow.add_edge("coder", "supervisor")
 workflow.add_edge("security", "supervisor")
 workflow.add_edge("writer", "supervisor")
 workflow.add_edge("github", "supervisor")
 
-# From supervisor, conditionally route to workers or end
 workflow.add_conditional_edges(
     "supervisor",
     route_next,
@@ -481,11 +569,12 @@ workflow.add_conditional_edges(
         "security": "security",
         "writer": "writer",
         "github": "github",
-        "END": END
-    }
+        "END": END,
+    },
 )
 
 app = workflow.compile()
+
 
 # ==========================================
 # 7. Run the Supervisor Multi-Agent System
@@ -495,31 +584,28 @@ if __name__ == "__main__":
 
     initial_inputs = {
         "task": (
-            "Create a function that takes a list of file paths and deletes them. "
-            "Security requirements (and ONLY these): "
-            "(a) refuse symlinks (the named entry, never a symlink target); "
-            "(b) when allowed_root is given, refuse paths outside it; "
-            "(c) refuse non-regular files (dirs, FIFOs, devices). "
-            "EXPLICIT NON-GOALS (out of scope, do NOT report as findings): "
-            "TOCTOU against attackers with write access to the parent directory; "
-            "Windows alternate data streams; 8.3 short names; hard links; "
-            "secure erasure of file contents; permission enforcement. "
-            "If the code satisfies (a)(b)(c) and does not regress them, "
-            "output SEVERITY: NONE."
+            "Create a Spring Boot 3 + React 18 project: a REST endpoint that "
+            "takes a list of file paths and safely deletes them "
+            "(refuse symlinks, refuse paths outside allowed_root, refuse "
+            "non-regular files), plus a React UI to call it. "
+            "EXPLICIT NON-GOALS (do not report as findings): TOCTOU, "
+            "Windows ADS, 8.3 names, hard links, secure erasure, permission "
+            "enforcement."
         ),
         "messages": [],
         "next_agent": "",
         "code": "",
+        "files": {},                # ← 补上：多文件字典
         "security_report": "",
         "needs_fix": False,
         "fix_attempts": 0,
         "documentation": "",
-        # GitHub 配置
+        "iteration_count": 0,       # ← 补上：supervisor 熔断依赖
         "github_owner": "homerLi007",
         "github_repo": "ai-coding-demo",
         "github_base_branch": "main",
         "github_code_path": "",
-        "github_pr_url": ""
+        "github_pr_url": "",
     }
 
     for event in app.stream(initial_inputs, stream_mode="values"):
@@ -528,4 +614,4 @@ if __name__ == "__main__":
     print("\n✨ Supervisor Workflow Finished Successfully!")
 
 
-__all__ = ["workflow", "SupervisorState"]
+__all__ = ["app", "workflow", "SupervisorState"]
