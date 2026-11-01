@@ -160,6 +160,56 @@ _NO_EXT_WHITELIST = {
     ".npmrc", ".env.example", ".editorconfig",
 }
 
+def _check_hard_constraints(files: dict) -> str | None:
+    """静态检查生成的项目是否违反 HARD CONSTRAINTS。
+    返回 None 表示通过，否则返回违规描述。
+    """
+    pom = files.get("backend/pom.xml", "")
+    if "spring-boot-starter-security" in pom:
+        return (
+            "HARD CONSTRAINT VIOLATED: pom.xml contains "
+            "spring-boot-starter-security. Remove it and delete any security "
+            "config classes."
+        )
+
+    # 检查所有 Java 文件
+    java_files = {p: c for p, c in files.items()
+                  if p.startswith("backend/src/main/java/") and p.endswith(".java")}
+    for path, content in java_files.items():
+        for forbidden in ("UserDetailsService", "SecurityFilterChain",
+                          "WebSecurityConfigurerAdapter", "ADMIN_PASSWORD",
+                          "BCryptPasswordEncoder"):
+            if forbidden in content:
+                return (
+                    f"HARD CONSTRAINT VIOLATED: {path} references "
+                    f"'{forbidden}'. Delete this file and any related "
+                    f"security code."
+                )
+        # 检查 @Value 是否带默认值
+        for m in re.finditer(r'@Value\("([^"]+)"\)', content):
+            expr = m.group(1)
+            if expr.startswith("${") and ":" not in expr:
+                return (
+                    f"HARD CONSTRAINT VIOLATED: {path} uses "
+                    f'@Value("{expr}") without a default. Use '
+                    f'@Value("${{{expr[2:-1]}:someDefault}}") or hardcode it.'
+                )
+
+    # 检查 application.properties 里的 ${...} 占位符
+    props = files.get("backend/src/main/resources/application.properties", "")
+    for line in props.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if "${" in value:
+            return (
+                f"HARD CONSTRAINT VIOLATED: application.properties has "
+                f"'{key}={value}' — no ${{ENV}} placeholders allowed. Use a "
+                f"literal default value."
+            )
+
+    return None
 
 def sanitize_filename(name: str) -> str:
     """把 LLM 返回的相对路径清洗成安全的、仓库内可用的路径。
@@ -240,15 +290,31 @@ frontend/src/main.jsx
 frontend/src/App.jsx
 frontend/src/App.css
 
+## HARD CONSTRAINTS (violating any of these = invalid output)
+1. **ZERO environment variables.** The generated app MUST start with plain
+   `mvn spring-boot:run` and NO environment variables set. Every value must
+   have a reasonable default, either hardcoded or in `application.properties`.
+2. **DO NOT add `spring-boot-starter-security` to pom.xml.** The only allowed
+   Spring Boot starters are: `spring-boot-starter-web` and
+   `spring-boot-starter-test` (test scope).
+3. **DO NOT create any `SecurityConfig`, `WebSecurityConfig`, `UserDetailsService`,
+   `PasswordEncoder`, or anything under a `config/` or `security/` package.**
+4. **DO NOT use `@Value("${SOMETHING}")` without a default.** If you must read a
+   property, write `@Value("${SOMETHING:literal-default}")`.
+5. **DO NOT put `${ENV_VAR}` placeholders in `application.properties`.**
+   Any key there must have a literal value.
+6. The only Java files allowed under `src/main/java/com/example/demo/` are:
+   `DemoApplication.java` and one file in `controller/`. Nothing else.
+7. No database, no auth, no JWT, no Spring Security, no Actuator, no Swagger.
+
 ## Rules
 1. Spring Boot 3.x, Java 17, Maven. Use `spring-boot-starter-parent` to manage
    dependency versions — do NOT hardcode dependency versions.
 2. Exactly ONE `@RestController` with at least one endpoint that satisfies the
-   task. No database, no auth, no Spring Security.
+   task.
 3. React 18 + Vite + plain JavaScript (no TypeScript). App.jsx calls the backend
    via `fetch('/api/...')` — relative path, same-origin in production.
-4. Keep each file SHORT (under 120 lines). Do not add extra features, extra
-   controllers, or extra React components.
+4. Keep each file SHORT (under 120 lines). Do not add extra features.
 5. Do not invent endpoints the React code does not call; do not call endpoints
    the backend does not expose.
 6. Return ONLY valid JSON. No markdown fences, no prose before/after.
@@ -474,6 +540,31 @@ def coder_node(state: SupervisorState):
 def security_node(state: SupervisorState):
     print("\n🔒 [Security Auditor]: Auditing Spring Boot + React project...")
     files = state.get("files", {}) or {}
+
+    # ── 先做静态硬约束检查（不调用 LLM，快且确定）──
+    violation = _check_hard_constraints(files)
+    if violation:
+        print(f"🚫 {violation}")
+        severity = "CRITICAL"
+        needs_fix = True
+        fix_attempts = state.get("fix_attempts", 0)
+        BLOCKING_LIMIT = 10
+        if fix_attempts >= BLOCKING_LIMIT:
+            print(f"🚨 已修 {fix_attempts} 次仍未通过，强制放行")
+            needs_fix = False
+        return {
+            "security_report": (
+                f"SEVERITY: {severity}\n\n"
+                f"## Hard-constraint violation\n\n"
+                f"{violation}\n\n"
+                f"**Severity:** CRITICAL\n"
+                f"**Finding:** [FIXABLE] {violation}\n"
+            ),
+            "needs_fix": needs_fix,
+            "messages": [AIMessage(content=f"Security (CRITICAL): {violation}")],
+        }
+
+    # ── 静态检查通过，继续 LLM 审计 ──
     files_block = _format_files_for_prompt(files, max_chars=12000)
 
     prompt = f"""Audit this **Spring Boot + React** project for security issues:
