@@ -299,9 +299,9 @@ frontend/src/App.css
    `spring-boot-starter-test` (test scope).
 3. **DO NOT create any `SecurityConfig`, `WebSecurityConfig`, `UserDetailsService`,
    `PasswordEncoder`, or anything under a `config/` or `security/` package.**
-4. **DO NOT use `@Value("${SOMETHING}")` without a default.** If you must read a
-   property, write `@Value("${SOMETHING:literal-default}")`.
-5. **DO NOT put `${ENV_VAR}` placeholders in `application.properties`.**
+4. **DO NOT use `@Value("${{SOMETHING}}")` without a default.** If you must read a
+   property, write `@Value("${{SOMETHING:literal-default}}")`.
+5. **DO NOT put `${{ENV_VAR}}` placeholders in `application.properties`.**
    Any key there must have a literal value.
 6. The only Java files allowed under `src/main/java/com/example/demo/` are:
    `DemoApplication.java` and one file in `controller/`. Nothing else.
