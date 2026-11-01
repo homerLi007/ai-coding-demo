@@ -991,18 +991,6 @@ workflow.add_edge("github", "supervisor")
 workflow.add_edge("tester", "supervisor")
 workflow.add_edge("e2e_tester", "supervisor")
 
-workflow.add_conditional_edges(
-    "supervisor",
-    route_next,
-    {
-        "coder": "coder",
-        "security": "security",
-        "writer": "writer",
-        "github": "github",
-        "END": END,
-    },
-)
-
 # 条件边映射加两个新目标
 workflow.add_conditional_edges(
     "supervisor",
