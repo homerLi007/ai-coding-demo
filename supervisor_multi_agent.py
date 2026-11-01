@@ -54,21 +54,20 @@ def sanitize_py_filename(name: str) -> str:
     return f"{name.lower()}.py"
 
 def _extract_top_issues(report: str, max_issues: int = 3) -> list[str]:
-    """按 ### 切块，提取 [FIXABLE] 的最高优先级条目，保留完整修复方案。"""
-    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-
-    # 按 "###" 切块（要求 ### 在行首）
+    """只提取 CRITICAL / HIGH 级别的 [FIXABLE] 条目。"""
+    order = {"CRITICAL": 0, "HIGH": 1}
     blocks = re.split(r"(?m)^###\s+", report)
     parsed = []
-    for b in blocks[1:]:                      # 第一块是摘要，跳过
+    for b in blocks[1:]:
         if "[INHERENT]" in b or "[INFO]" in b:
-            continue                          # 不可修/信息性条目直接丢
+            continue
         if "[FIXABLE]" not in b:
-            continue                          # 没有标签的也不要
+            continue
         m = re.search(r"\*\*Severity:\*\*\s*(CRITICAL|HIGH|MEDIUM|LOW)", b, re.I)
         sev = m.group(1).upper() if m else "MEDIUM"
+        if sev not in ("CRITICAL", "HIGH"):
+            continue                                  # ← 只保留 CRITICAL/HIGH
         body = b.strip()
-        # 单条最多 1200 字符，保留 "Fix:" 段落
         parsed.append((order.get(sev, 99), f"### {body[:1200]}"))
 
     parsed.sort(key=lambda x: x[0])
@@ -234,40 +233,45 @@ def coder_node(state: SupervisorState):
         }
 
 def security_node(state: SupervisorState):
-    """Worker 2: 审计代码，返回结构化结果（含 needs_fix 标志）。"""
+    """Worker 2: 只把 CRITICAL/HIGH 视为阻塞；MEDIUM/LOW 仅记录不触发修复。"""
     print("\n🔒 [Security Auditor]: Auditing code for vulnerabilities...")
     code = state["code"]
 
     prompt = f"""Audit this Python code for security issues:
-    
-    <code>
-    {code}
-    </code>
-    
-    Output format (follow EXACTLY):
-    Line 1: SEVERITY: <CRITICAL|HIGH|MEDIUM|LOW|NONE>
-    Line 2: (blank line)
-    Line 3+: Full markdown audit report.
-    
-    Severity rules:
-    - CRITICAL : remote exploitable, data loss, RCE — must fix
-    - HIGH     : serious vulnerability, exploitable under realistic conditions — must fix
-    - MEDIUM   : real weakness requiring specific conditions — must fix
-    - LOW      : minor weakness or best-practice deviation — must fix
-    - NONE     : no actionable issue remains
-    
-    Only report issues that can be fixed by changing the code.
-    Do NOT report purely informational observations (e.g. "hard links not handled", "docstring could be clearer") as findings — those are out of scope.
-    If every remaining issue is purely informational and no code change would resolve it, output SEVERITY: NONE.
-    
-    Do NOT wrap the output in JSON or code fences.
-    Use the SAME severity threshold consistently. Do NOT escalate an issue
-    from LOW to HIGH across audits of functionally equivalent code.
-    For every finding, prefix the body with one of:
-    [FIXABLE]  - can be fixed by changing this code
-    [INHERENT] - fundamental POSIX/kernel limitation, cannot be fixed in user space
-    [INFO]     - informational, no code change needed
-    """
+
+<code>
+{code}
+</code>
+
+Output format (follow EXACTLY):
+Line 1: SEVERITY: <CRITICAL|HIGH|MEDIUM|LOW|NONE>
+Line 2: (blank line)
+Line 3+: Full markdown audit report.
+
+Severity rules (STRICT):
+- CRITICAL : remote exploitable, data loss, RCE — BLOCKS shipping
+- HIGH     : serious vulnerability, exploitable under realistic conditions — BLOCKS shipping
+- MEDIUM   : real weakness requiring specific conditions — reported only, does NOT block
+- LOW      : minor weakness or best-practice deviation — reported only, does NOT block
+- NONE     : no actionable issue remains
+
+IMPORTANT:
+ONLY CRITICAL and HIGH trigger a code rewrite. MEDIUM and LOW are recorded
+in the report for the human reviewer but will NOT trigger any automated fix.
+Therefore, do NOT escalate MEDIUM to HIGH merely because you think it
+"should be fixed". Reserve CRITICAL/HIGH for genuinely exploitable issues.
+If every finding is MEDIUM or LOW, output SEVERITY: MEDIUM (or LOW), not HIGH.
+
+Only report issues that can be fixed by changing the code.
+Do NOT report purely informational observations as findings.
+Do NOT wrap the output in JSON or code fences.
+Use the SAME severity threshold consistently.
+
+For every finding, prefix the body with one of:
+[FIXABLE]  - can be fixed by changing this code
+[INHERENT] - fundamental POSIX/kernel limitation, cannot be fixed in user space
+[INFO]     - informational, no code change needed
+"""
 
     response = llm.invoke([HumanMessage(content=prompt)])
     content = response.content.strip()
@@ -279,14 +283,13 @@ def security_node(state: SupervisorState):
         print("⚠️ 无法从首行解析 severity，默认按 MEDIUM 处理（不回退）")
         severity = "MEDIUM"
 
-    needs_fix = severity != "NONE"
+    # 🔑 关键改动：只有 CRITICAL / HIGH 才触发修复
+    needs_fix = severity in ("CRITICAL", "HIGH")
 
-    # 熔断：修复次数超过上限后强制放行，避免 LOW 级别无限循环
+    # 熔断：只为 CRITICAL / HIGH 保留（MEDIUM/LOW 根本不会走到这里）
     fix_attempts = state.get("fix_attempts", 0)
-
-    LIMITS = {"CRITICAL": 30, "HIGH": 30, "MEDIUM": 6, "LOW": 3}
-
-    if needs_fix and fix_attempts >= LIMITS.get(severity, 3):
+    BLOCKING_LIMIT = 10   # CRITICAL/HIGH 最多修 10 次
+    if needs_fix and fix_attempts >= BLOCKING_LIMIT:
         print(f"🚨 {severity} 已修 {fix_attempts} 次仍未通过，强制放行（PR 将带问题提交）")
         needs_fix = False
 
