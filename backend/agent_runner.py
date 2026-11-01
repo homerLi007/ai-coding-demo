@@ -43,6 +43,13 @@ async def run_agent_stream(req: Dict[str, Any]) -> AsyncGenerator[str, None]:
                 if "fix_attempts" in update:
                     event["fix_attempts"] = update["fix_attempts"]
 
+                if update.get("generated_repo_url"):
+                    event["generated_repo_url"] = update["generated_repo_url"]
+                if update.get("app_url"):
+                    event["app_url"] = update["app_url"]
+                if update.get("app_nodeport"):
+                    event["app_nodeport"] = update["app_nodeport"]
+
                 # 👇👇👇 加在这里：紧跟在 fix_attempts 之后，github_pr_url 之前 👇👇👇
                 if "files" in update and update["files"]:
                     event["file_count"] = len(update["files"])

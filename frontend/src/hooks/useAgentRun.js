@@ -6,6 +6,12 @@ export function useAgentRun() {
   const [events, setEvents] = useState([]);
   const [prUrl, setPrUrl] = useState(null);
   const [error, setError] = useState(null);
+
+  // 👇👇👇 新增：两行 state 定义，和上面几个 useState 并列 👇👇👇
+  const [appUrl, setAppUrl] = useState(null);
+  const [repoUrl, setRepoUrl] = useState(null);
+  // 👆👆👆 新增结束 👆👆👆
+
   const abortRef = useRef(null);
 
   const run = useCallback(async (params) => {
@@ -13,23 +19,35 @@ export function useAgentRun() {
     setEvents([]);
     setPrUrl(null);
     setError(null);
+    // 👇 顺手把新增的 state 也重置（可选但推荐）
+    setAppUrl(null);
+    setRepoUrl(null);
+    // 👆
     abortRef.current = new AbortController();
 
     try {
       await runAgentStream(
         params,
         ({ type, data }) => {
-          // 错误事件直接记录
           if (type === "error") {
             setError(data?.message || JSON.stringify(data));
             return;
           }
-          // 正常事件累积（同时记录时间戳，便于展示）
+
           setEvents((prev) => [...prev, { type, data, at: Date.now() }]);
-          // 捕获最终 PR 链接
+
           if (data?.final && data?.pr_url) {
             setPrUrl(data.pr_url);
           }
+
+          // 👇👇👇 新增：在 onEvent 回调里捕获 app_url / repo_url 👇👇👇
+          if (data?.app_url) {
+            setAppUrl(data.app_url);
+          }
+          if (data?.generated_repo_url) {
+            setRepoUrl(data.generated_repo_url);
+          }
+          // 👆👆👆 新增结束 👆👆👆
         },
         abortRef.current.signal
       );
@@ -46,5 +64,16 @@ export function useAgentRun() {
     abortRef.current?.abort();
   }, []);
 
-  return { run, cancel, running, events, prUrl, error };
+  // 👇👇👇 修改：return 里加上 appUrl 和 repoUrl 👇👇👇
+  return {
+    run,
+    cancel,
+    running,
+    events,
+    prUrl,
+    error,
+    appUrl,
+    repoUrl,
+  };
+  // 👆👆👆 修改结束 👆👆👆
 }

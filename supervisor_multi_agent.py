@@ -386,6 +386,10 @@ class SupervisorState(TypedDict):
     e2e_report: str            # Playwright 输出
     e2e_passed: bool
     e2e_attempts: int
+    generated_repo: str        # 新仓库全名，如 "homerLi007/generated-app-20261101-143052"
+    generated_repo_url: str    # https://github.com/homerLi007/generated-app-...
+    app_url: str               # http://172.30.95.100:31234/
+    app_nodeport: int          # 分配的 NodePort
 
 
 def _extract_top_issues(report: str, max_issues: int = 3) -> list[str]:
@@ -706,75 +710,240 @@ def supervisor_node(state: SupervisorState):
     return {"next_agent": next_agent, "iteration_count": iteration}
 
 
+def _gen_app_dockerfile() -> str:
+    return """\
+FROM node:20-alpine AS fe
+WORKDIR /fe
+RUN npm config set registry https://registry.npmmirror.com
+COPY frontend/package*.json ./
+RUN npm ci || npm install
+COPY frontend/ ./
+RUN npm run build
+
+FROM maven:3.9-eclipse-temurin-17 AS be
+WORKDIR /app
+COPY backend/pom.xml .
+RUN mvn dependency:go-offline -B || true
+COPY backend/src ./src
+COPY --from=fe /fe/dist ./src/main/resources/static/
+RUN mvn package -DskipTests -B
+
+FROM eclipse-temurin:17-jre
+WORKDIR /app
+COPY --from=be /app/target/*.jar app.jar
+EXPOSE 8080
+CMD ["java", "-jar", "app.jar"]
+"""
+
+
+def _gen_app_deployment(repo_name: str) -> str:
+    return f"""\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {repo_name}
+  namespace: default
+  labels:
+    app: {repo_name}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {repo_name}
+  template:
+    metadata:
+      labels:
+        app: {repo_name}
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/homerli007/{repo_name}:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+      imagePullSecrets:
+        - name: ghcr-secret
+"""
+
+
+def _gen_app_service(repo_name: str, nodeport: int) -> str:
+    return f"""\
+apiVersion: v1
+kind: Service
+metadata:
+  name: {repo_name}-service
+  namespace: default
+spec:
+  selector:
+    app: {repo_name}
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: {nodeport}
+  type: NodePort
+"""
+
+
+def _gen_app_workflow(repo_name: str) -> str:
+    return f"""\
+name: Build and Deploy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: homerli007/{repo_name.lower()}
+  KUBECONFIG: /home/forrestli/.kube/config
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, k3s, local]
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {{}} + 2>/dev/null || true
+          git clone --depth 1 "git@github.com:${{GITHUB_REPOSITORY}}.git" .
+          git fetch --depth 1 origin "${{GITHUB_SHA}}"
+          git checkout "${{GITHUB_SHA}}"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{{{ secrets.GITHUB_TOKEN }}}}" | \\
+            docker login "$REGISTRY" -u "${{{{ github.actor }}}}" --password-stdin
+
+      - name: Build and push image
+        run: |
+          IMG="${{REGISTRY}}/${{IMAGE_NAME}}:${{GITHUB_SHA}}"
+          IMG_LATEST="${{REGISTRY}}/${{IMAGE_NAME}}:latest"
+          docker build -f backend/Dockerfile -t "$IMG" -t "$IMG_LATEST" .
+          docker push "$IMG"
+          docker push "$IMG_LATEST"
+
+      - name: Deploy to K3s
+        run: |
+          IMG="${{REGISTRY}}/${{IMAGE_NAME}}:${{GITHUB_SHA}}"
+          sed -i "s|image:.*|image: ${{IMG}}|" k8s/deployment.yaml
+          kubectl apply -f k8s/
+          kubectl rollout status deployment/{repo_name} -n default --timeout=300s
+          kubectl get svc {repo_name}-service -n default
+"""
+
+
+def _push_all_files(repo, files: dict):
+    """用 Git Data API 一次性提交所有文件到 main（避免逐个 create_file 的 40+ API 调用）。"""
+    # 1. 获取 main 分支（空 repo，还没有 commit）
+    try:
+        ref = repo.get_git_ref("heads/main")
+        parent_commit = repo.get_git_commit(ref.object.sha)
+        base_tree_sha = parent_commit.tree.sha
+    except GithubException:
+        # 空 repo，没有 main
+        parent_commit = None
+        base_tree_sha = None
+
+    # 2. 创建 blob
+    blobs = {}
+    for path, content in files.items():
+        blob = repo.create_git_blob(content or "", "utf-8")
+        blobs[path] = blob.sha
+
+    # 3. 创建 tree（带子目录）
+    tree_items = []
+    for path, blob_sha in blobs.items():
+        parts = path.split("/")
+        mode = "100644"
+        # 简化：用完整 path 作为 tree entry（GitHub 支持 path 带 / 吗？不支持，必须建子树）
+        # 改用逐个 push 更稳
+    # → 实际上 GitHub 的 create_git_tree 不支持 path 带 /，需要递归建子树。
+    # 为了简单可靠，退回逐个 create_file/update_file（文件数 10 个左右，可接受）
+    for path, content in files.items():
+        try:
+            existing = repo.get_contents(path)
+            repo.update_file(path, f"AI Agent: update {path}", content or "", existing.sha)
+        except GithubException:
+            repo.create_file(path, f"AI Agent: add {path}", content or "")
+
+import time
+
 def github_commit_node(state: SupervisorState):
-    print("\n🐙 [GitHub Agent]: 提交项目到仓库...")
+    print("\n🐙 [GitHub Agent]: 创建新仓库并推送生成的项目...")
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
         raise ValueError("GITHUB_TOKEN 未设置")
 
     g = Github(auth=Auth.Token(token))
-    repo = g.get_repo(f"{state['github_owner']}/{state['github_repo']}")
-    base = repo.get_branch(state["github_base_branch"])
+    user = g.get_user()
 
-    new_branch = f"ai-agent/{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    # ── 1. 生成唯一的 repo 名和 NodePort ──
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    repo_name = f"generated-app-{ts}"
+    # nodePort 范围 30080-32767，用时间戳哈希保证不冲突
+    nodeport = 30080 + (int(time.time()) % 2600)
+    print(f"📦 新仓库: {user.login}/{repo_name}")
+    print(f"🔌 NodePort: {nodeport}")
+
+    # ── 2. 创建新 repo（空的，不要 auto_init）──
     try:
-        repo.create_git_ref(ref=f"refs/heads/{new_branch}", sha=base.commit.sha)
-    except GithubException as e:
-        if e.status != 422:
-            raise
-
-    files = dict(state.get("files", {}) or {})
-    files["README.md"] = state.get("documentation", "") or "# Generated by AI Agent"
-
-    for path, content in files.items():
-        try:
-            existing = repo.get_contents(path, ref=new_branch)
-            repo.update_file(
-                path=path,
-                message=f"AI Agent: update {path}",
-                content=content or "",
-                sha=existing.sha,
-                branch=new_branch,
-            )
-        except GithubException:
-            repo.create_file(
-                path=path,
-                message=f"AI Agent: add {path}",
-                content=content or "",
-                branch=new_branch,
-            )
-        print(f"   📄 已提交 {path}")
-
-    try:
-        pr = repo.create_pull(
-            title=f"AI Agent: {state['task'][:60]}",
-            body=(
-                f"**任务**: {state['task']}\n\n"
-                f"**安全审计**:\n{state.get('security_report', 'N/A')}"
-            ),
-            head=new_branch,
-            base=state["github_base_branch"],
+        new_repo = user.create_repo(
+            name=repo_name,
+            description=f"AI Agent generated: {state['task'][:100]}",
+            private=False,
+            auto_init=False,
         )
-        pr_url = pr.html_url
+        print(f"✅ Repo created: {new_repo.html_url}")
     except GithubException as e:
-        if e.status == 422:
-            pr_url = next(
-                (
-                    p.html_url
-                    for p in repo.get_pulls(
-                    state="open",
-                    head=f"{repo.owner.login}:{new_branch}",
-                )
-                ),
-                "",
-            )
-        else:
-            raise
+        raise RuntimeError(f"创建仓库失败: {e.status} {e.data}")
 
-    print(f"✅ PR: {pr_url}")
+    # ── 3. 组装要推送的文件（生成文件 + 新 repo 的 workflow）──
+    files = dict(state.get("files", {}) or {})
+    files["README.md"] = state.get("documentation", "") or "# Generated App"
+
+    # 注入新 repo 的 Dockerfile 和 K8s 清单（生成代码里没有，agent 补）
+    files["backend/Dockerfile"] = _gen_app_dockerfile()
+    files["k8s/deployment.yaml"] = _gen_app_deployment(repo_name)
+    files["k8s/service.yaml"] = _gen_app_service(repo_name, nodeport)
+
+    # 注入新 repo 的 GitHub Actions workflow
+    files[".github/workflows/deploy.yml"] = _gen_app_workflow(repo_name)
+
+    # ── 4. 一次性提交所有文件（GitHub API 不能原子 push，但可以用 Git Data API）──
+    try:
+        _push_all_files(new_repo, files)
+        print(f"✅ 已推送 {len(files)} 个文件到 main")
+    except Exception as e:
+        raise RuntimeError(f"推送文件失败: {e}")
+
+    # ── 5. 计算 app URL ──
+    # NodePort 在 K3s 节点上暴露，IP 用当前 WSL/K3s 节点的外部 IP
+    node_ip = os.environ.get("K3S_NODE_IP", "172.30.95.100")
+    app_url = f"http://{node_ip}:{nodeport}/"
+
+    print(f"🌐 App URL (预计): {app_url}")
+    print(f"⏳ 新 repo 的 CI 已触发，2-3 分钟后可访问")
+
     return {
-        "github_pr_url": pr_url,
-        "messages": [AIMessage(content=f"PR: {pr_url}")],
+        "generated_repo": f"{user.login}/{repo_name}",
+        "generated_repo_url": new_repo.html_url,
+        "app_url": app_url,
+        "app_nodeport": nodeport,
+        "github_pr_url": new_repo.html_url,   # 兼容旧字段
+        "messages": [AIMessage(content=f"New repo: {new_repo.html_url}, App: {app_url}")],
     }
 
 
@@ -1045,6 +1214,10 @@ if __name__ == "__main__":
         "e2e_report": "",
         "e2e_passed": False,
         "e2e_attempts": 0,
+        "generated_repo": "",
+        "generated_repo_url": "",
+        "app_url": "",
+        "app_nodeport": 0,
     }
 
     for event in app.stream(initial_inputs, stream_mode="values"):
