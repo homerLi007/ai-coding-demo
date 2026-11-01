@@ -10,6 +10,10 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from dotenv import load_dotenv
 from github import Github, Auth, GithubException
+import subprocess
+import tempfile
+import time
+import socket
 
 load_dotenv()
 
@@ -23,6 +27,132 @@ _ALLOWED_EXTS = {
     ".js", ".jsx", ".ts", ".tsx", ".json", ".html", ".css",
     ".py", ".md", ".txt",
 }
+
+def _port_ready(host: str, port: int, timeout: float = 60.0) -> bool:
+    """等待端口就绪"""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(0.5)
+    return False
+
+
+def _write_files_to_dir(files: dict, base_dir: str, prefix: str) -> None:
+    """把 files 里以 prefix 开头的文件写到 base_dir 下"""
+    for path, content in files.items():
+        if not path.startswith(prefix):
+            continue
+        rel = path[len(prefix):]
+        full = os.path.join(base_dir, rel)
+        os.makedirs(os.path.dirname(full) or base_dir, exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(content or "")
+
+
+def _run_mvn_test(files: dict, timeout: int = 300) -> tuple[bool, str]:
+    """在临时目录里跑 `mvn test`，返回 (passed, output)"""
+    if not any(p.startswith("backend/") for p in files):
+        return False, "no backend/ files to test"
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = os.path.join(tmp, "backend")
+        os.makedirs(backend)
+        _write_files_to_dir(files, backend, "backend/")
+        try:
+            r = subprocess.run(
+                ["mvn", "test", "-B", "-q"],
+                cwd=backend, capture_output=True, text=True, timeout=timeout,
+            )
+            return r.returncode == 0, (r.stdout or "") + "\n" + (r.stderr or "")
+        except subprocess.TimeoutExpired:
+            return False, f"mvn test timed out after {timeout}s"
+        except FileNotFoundError:
+            return False, "mvn not found in PATH (check Dockerfile)"
+        except Exception as e:
+            return False, f"mvn test failed: {e}"
+
+
+def _run_e2e(files: dict, e2e_files: dict, timeout: int = 300) -> tuple[bool, str]:
+    """启动 Spring Boot + React，跑 Playwright，返回 (passed, output)"""
+    backend_proc = None
+    frontend_proc = None
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = os.path.join(tmp, "backend")
+        frontend = os.path.join(tmp, "frontend")
+        e2e_dir = os.path.join(tmp, "e2e")
+        for d in (backend, frontend, e2e_dir):
+            os.makedirs(d)
+        _write_files_to_dir(files, backend, "backend/")
+        _write_files_to_dir(files, frontend, "frontend/")
+        _write_files_to_dir(e2e_files, e2e_dir, "e2e/")
+
+        try:
+            # 1. 编译后端
+            r = subprocess.run(
+                ["mvn", "package", "-DskipTests", "-B", "-q"],
+                cwd=backend, capture_output=True, text=True, timeout=180,
+            )
+            if r.returncode != 0:
+                return False, "mvn package failed:\n" + r.stdout + r.stderr
+
+            # 2. 启动后端
+            target = os.path.join(backend, "target")
+            jars = [f for f in os.listdir(target)
+                    if f.endswith(".jar") and "sources" not in f and "original" not in f]
+            if not jars:
+                return False, "no jar found in target/"
+            backend_proc = subprocess.Popen(
+                ["java", "-jar", os.path.join(target, jars[0])],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            if not _port_ready("localhost", 8080, timeout=90):
+                return False, "backend did not start within 90s"
+
+            # 3. 安装前端依赖
+            r = subprocess.run(
+                ["npm", "install", "--registry=https://registry.npmmirror.com"],
+                cwd=frontend, capture_output=True, text=True, timeout=180,
+            )
+            if r.returncode != 0:
+                return False, "npm install failed:\n" + r.stdout + r.stderr
+
+            # 4. 启动前端
+            frontend_proc = subprocess.Popen(
+                ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5173"],
+                cwd=frontend,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            if not _port_ready("localhost", 5173, timeout=90):
+                return False, "frontend did not start within 90s"
+
+            # 5. 安装 e2e 依赖 + 跑 Playwright
+            r = subprocess.run(
+                ["npm", "install", "--registry=https://registry.npmmirror.com"],
+                cwd=e2e_dir, capture_output=True, text=True, timeout=180,
+            )
+            if r.returncode != 0:
+                return False, "e2e npm install failed:\n" + r.stdout + r.stderr
+
+            r = subprocess.run(
+                ["npx", "playwright", "test", "--reporter=line"],
+                cwd=e2e_dir, capture_output=True, text=True, timeout=timeout,
+                env={**os.environ, "BASE_URL": "http://localhost:5173"},
+            )
+            return r.returncode == 0, (r.stdout or "") + "\n" + (r.stderr or "")
+        except subprocess.TimeoutExpired as e:
+            return False, f"e2e timed out: {e}"
+        except Exception as e:
+            return False, f"e2e failed: {e}"
+        finally:
+            for proc in (backend_proc, frontend_proc):
+                if proc and proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
 
 # 无扩展名但合法、必须保留原名的文件
 _NO_EXT_WHITELIST = {
@@ -183,6 +313,13 @@ class SupervisorState(TypedDict):
     github_base_branch: str
     github_code_path: str
     github_pr_url: str
+    # ── 测试相关（新增）──
+    test_report: str           # mvn test 的完整输出
+    test_passed: bool          # mvn test 是否通过
+    test_attempts: int         # 测试修复次数（用于熔断）
+    e2e_report: str            # Playwright 输出
+    e2e_passed: bool
+    e2e_attempts: int
 
 
 def _extract_top_issues(report: str, max_issues: int = 3) -> list[str]:
@@ -309,12 +446,14 @@ def coder_node(state: SupervisorState):
             "files": merged,
             "code": primary_content,
             "github_code_path": primary,
-            "security_report": "",
+            "security_report": "",       # 重新审计
+            "test_report": "",           # ← 新增：重新测试
+            "test_passed": False,        # ← 新增
+            "e2e_report": "",            # ← 新增：重新 E2E
+            "e2e_passed": False,         # ← 新增
             "needs_fix": False,
             "fix_attempts": fix_attempts + (1 if is_fixing else 0),
-            "messages": [
-                AIMessage(content=f"Coder: {len(merged)} files, {changes}")
-            ],
+            "messages": [AIMessage(content=f"Coder: {len(merged)} files, {changes}")],
         }
 
     except Exception as exc:
@@ -438,21 +577,38 @@ Return ONLY the raw README.md content. Do NOT wrap in a code fence.
 def supervisor_node(state: SupervisorState):
     print("\n👑 [Supervisor / Tech Lead]: Evaluating project status...")
 
+    # 1. 首次生成
     if not state.get("code"):
         next_agent = "coder"
+    # 2. security 打回
     elif state.get("needs_fix"):
         next_agent = "coder"
+    # 3. 无安全审计
     elif not state.get("security_report"):
         next_agent = "security"
+    # 4. 无测试报告（且未熔断）
+    elif not state.get("test_report") and state.get("test_attempts", 0) < 3:
+        next_agent = "tester"
+    # 5. 测试失败打回（最多 3 次）
+    elif state.get("test_attempts", 0) < 3 and state.get("test_report") and not state.get("test_passed"):
+        next_agent = "coder"
+    # 6. 无 E2E 报告（且未熔断）
+    elif not state.get("e2e_report") and state.get("e2e_attempts", 0) < 3:
+        next_agent = "e2e_tester"
+    # 7. E2E 失败打回（最多 3 次）
+    elif state.get("e2e_attempts", 0) < 3 and state.get("e2e_report") and not state.get("e2e_passed"):
+        next_agent = "coder"
+    # 8. 无文档
     elif not state.get("documentation"):
         next_agent = "writer"
+    # 9. 无 PR
     elif not state.get("github_pr_url"):
         next_agent = "github"
     else:
         next_agent = "FINISH"
 
     iteration = state.get("iteration_count", 0) + 1
-    if iteration > 50:
+    if iteration > 80:              # 加测试后流程更长，上限从 50 提到 80
         next_agent = "FINISH"
 
     print(f"🎯 Supervisor Decision -> Next Worker: {next_agent}")
@@ -531,15 +687,193 @@ def github_commit_node(state: SupervisorState):
     }
 
 
+TESTER_PROMPT = """Generate JUnit 5 tests for this Spring Boot project.
+
+## Project files (backend only)
+{backend_files}
+
+## Output format
+Return JSON:
+{{
+  "files": {{ "<path>": "<file content>", ... }},
+  "notes": "optional"
+}}
+
+## Rules
+1. Use `@SpringBootTest` + `MockMvc` for controller tests — do NOT start a real server.
+2. Put tests under `backend/src/test/java/com/example/demo/`.
+3. At least one test that hits the main endpoint and asserts the response status.
+4. Keep each test file under 80 lines. Do not test things that require a database.
+5. Return ONLY valid JSON, no markdown fences.
+"""
+
+
+def tester_node(state: SupervisorState):
+    print("\n🧪 [Tester Agent]: Generating JUnit tests...")
+    files = state.get("files", {}) or {}
+    attempts = state.get("test_attempts", 0) + 1
+
+    backend_files = {k: v for k, v in files.items() if k.startswith("backend/")}
+    if not backend_files:
+        return {
+            "test_report": "No backend files to test",
+            "test_passed": False,
+            "test_attempts": attempts,
+            "messages": [AIMessage(content="Tester: no backend files")],
+        }
+
+    try:
+        prompt = TESTER_PROMPT.format(
+            backend_files=_format_files_for_prompt(backend_files, max_chars=10000)
+        )
+        response = llm.invoke([HumanMessage(content=prompt)])
+        content = response.content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*", "", content)
+            content = re.sub(r"\s*```$", "", content)
+
+        try:
+            payload = json.loads(content)
+            test_files = payload.get("files", {})
+        except json.JSONDecodeError:
+            return {
+                "test_report": "LLM failed to return valid JSON for tests",
+                "test_passed": False,
+                "test_attempts": attempts,
+                "messages": [AIMessage(content="Tester: JSON parse failed")],
+            }
+
+        # 清洗测试文件路径
+        cleaned = {}
+        for p, c in test_files.items():
+            if isinstance(c, str):
+                cleaned[sanitize_filename(p)] = c
+
+        print(f"📄 生成 {len(cleaned)} 个测试文件")
+        # 合并到 files 里一起跑（但不写回 state.files，避免提交到 PR）
+        all_files = {**files, **cleaned}
+
+        print("⏳ 运行 mvn test...")
+        passed, output = _run_mvn_test(all_files, timeout=300)
+
+        # 只保留输出末尾 3000 字符，避免 state 太大
+        report = f"=== mvn test ({'PASSED' if passed else 'FAILED'}) ===\n{output[-3000:]}"
+        print(f"🛡️ Test result: {'PASSED' if passed else 'FAILED'}")
+
+        return {
+            "test_report": report,
+            "test_passed": passed,
+            "test_attempts": attempts,
+            "messages": [AIMessage(content=f"Tester: {'PASSED' if passed else 'FAILED'}")],
+        }
+    except Exception as e:
+        print(f"❌ Tester 异常: {e}")
+        return {
+            "test_report": f"Tester error: {e}",
+            "test_passed": False,
+            "test_attempts": attempts,
+            "messages": [AIMessage(content=f"Tester error: {e}")],
+        }
+
+E2E_PROMPT = """Generate Playwright tests that click through the React UI.
+
+## Frontend files
+{frontend_files}
+
+## Backend files (for understanding endpoints)
+{backend_files}
+
+## Output format
+Return JSON:
+{{
+  "files": {{ "<path>": "<file content>", ... }},
+  "notes": "optional"
+}}
+
+## Rules
+1. Files to generate (EXACT paths):
+   - e2e/package.json         (depends on @playwright/test)
+   - e2e/playwright.config.js (use process.env.BASE_URL || 'http://localhost:5173', chromium only, headless)
+   - e2e/tests/app.spec.js    (at least 2 tests)
+2. Tests must use `page.goto(BASE_URL)` — do NOT hardcode localhost.
+3. At least one test asserts the page title or a visible heading.
+4. At least one test clicks a button (e.g., the "Run Agent" button) and waits for a UI change.
+5. Keep each file under 60 lines.
+6. Return ONLY valid JSON, no markdown fences.
+"""
+
+
+def e2e_tester_node(state: SupervisorState):
+    print("\n🌐 [E2E Tester]: Generating Playwright tests...")
+    files = state.get("files", {}) or {}
+    attempts = state.get("e2e_attempts", 0) + 1
+
+    frontend_files = {k: v for k, v in files.items() if k.startswith("frontend/")}
+    backend_files = {k: v for k, v in files.items() if k.startswith("backend/")}
+
+    if not frontend_files:
+        return {
+            "e2e_report": "No frontend files to test",
+            "e2e_passed": False,
+            "e2e_attempts": attempts,
+            "messages": [AIMessage(content="E2E: no frontend files")],
+        }
+
+    try:
+        prompt = E2E_PROMPT.format(
+            frontend_files=_format_files_for_prompt(frontend_files, max_chars=6000),
+            backend_files=_format_files_for_prompt(backend_files, max_chars=4000),
+        )
+        response = llm.invoke([HumanMessage(content=prompt)])
+        content = response.content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*", "", content)
+            content = re.sub(r"\s*```$", "", content)
+
+        try:
+            payload = json.loads(content)
+            e2e_files = payload.get("files", {})
+        except json.JSONDecodeError:
+            return {
+                "e2e_report": "LLM failed to return valid JSON for e2e tests",
+                "e2e_passed": False,
+                "e2e_attempts": attempts,
+                "messages": [AIMessage(content="E2E: JSON parse failed")],
+            }
+
+        cleaned = {}
+        for p, c in e2e_files.items():
+            if isinstance(c, str):
+                cleaned[sanitize_filename(p)] = c
+
+        print(f"📄 生成 {len(cleaned)} 个 E2E 文件，启动服务中...")
+        passed, output = _run_e2e(files, cleaned, timeout=300)
+
+        report = f"=== Playwright ({'PASSED' if passed else 'FAILED'}) ===\n{output[-3000:]}"
+        print(f"🌐 E2E result: {'PASSED' if passed else 'FAILED'}")
+
+        return {
+            "e2e_report": report,
+            "e2e_passed": passed,
+            "e2e_attempts": attempts,
+            "messages": [AIMessage(content=f"E2E: {'PASSED' if passed else 'FAILED'}")],
+        }
+    except Exception as e:
+        print(f"❌ E2E 异常: {e}")
+        return {
+            "e2e_report": f"E2E error: {e}",
+            "e2e_passed": False,
+            "e2e_attempts": attempts,
+            "messages": [AIMessage(content=f"E2E error: {e}")],
+        }
+
 # ==========================================
 # 5. Define Conditional Routing Edge
 # ==========================================
-def route_next(
-        state: SupervisorState,
-) -> Literal["coder", "security", "writer", "github", "END"]:
-    next_agent = state["next_agent"]
-    if next_agent in ("coder", "security", "writer", "github"):
-        return next_agent
+def route_next(state) -> Literal["coder", "security", "tester", "e2e_tester", "writer", "github", "END"]:
+    n = state["next_agent"]
+    if n in ("coder", "security", "tester", "e2e_tester", "writer", "github"):
+        return n
     return "END"
 
 
@@ -553,6 +887,8 @@ workflow.add_node("coder", coder_node)
 workflow.add_node("security", security_node)
 workflow.add_node("writer", writer_node)
 workflow.add_node("github", github_commit_node)
+workflow.add_node("tester", tester_node)
+workflow.add_node("e2e_tester", e2e_tester_node)
 
 workflow.set_entry_point("supervisor")
 
@@ -560,6 +896,9 @@ workflow.add_edge("coder", "supervisor")
 workflow.add_edge("security", "supervisor")
 workflow.add_edge("writer", "supervisor")
 workflow.add_edge("github", "supervisor")
+# 边：tester / e2e_tester 完成后都回 supervisor
+workflow.add_edge("tester", "supervisor")
+workflow.add_edge("e2e_tester", "supervisor")
 
 workflow.add_conditional_edges(
     "supervisor",
@@ -567,6 +906,21 @@ workflow.add_conditional_edges(
     {
         "coder": "coder",
         "security": "security",
+        "writer": "writer",
+        "github": "github",
+        "END": END,
+    },
+)
+
+# 条件边映射加两个新目标
+workflow.add_conditional_edges(
+    "supervisor",
+    route_next,
+    {
+        "coder": "coder",
+        "security": "security",
+        "tester": "tester",          # ← 新增
+        "e2e_tester": "e2e_tester",  # ← 新增
         "writer": "writer",
         "github": "github",
         "END": END,
@@ -606,6 +960,12 @@ if __name__ == "__main__":
         "github_base_branch": "main",
         "github_code_path": "",
         "github_pr_url": "",
+        "test_report": "",
+        "test_passed": False,
+        "test_attempts": 0,
+        "e2e_report": "",
+        "e2e_passed": False,
+        "e2e_attempts": 0,
     }
 
     for event in app.stream(initial_inputs, stream_mode="values"):
