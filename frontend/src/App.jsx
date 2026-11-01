@@ -3,9 +3,13 @@ import { useAgentRun } from "./hooks/useAgentRun";
 
 export default function App() {
   // 表单字段（与后端 RunRequest 保持一致）
-  const [task, setTask] = useState(
-    "Create a function that takes a list of file paths and deletes them safely."
-  );
+    const [task, setTask] = useState(
+      "Create a Spring Boot 3 + React 18 project with a REST endpoint that " +
+      "takes a list of file paths and safely deletes them. " +
+      "Backend: Java 17, Maven, spring-boot-starter-web. " +
+      "Frontend: React 18 + Vite, calls /api/delete via fetch. " +
+      "Return the full project as files."
+    );
   const [owner, setOwner] = useState("homerLi007");
   const [repo, setRepo] = useState("ai-coding-demo");
   const [branch, setBranch] = useState("main");
