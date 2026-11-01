@@ -113,26 +113,23 @@ export default function App() {
           const d = e.data || {};
           return (
             <div key={i} style={styles.logLine}>
-              <span style={styles.logTime}>
-                {new Date(e.at).toLocaleTimeString()}
-              </span>
-              <span style={styles.logNode}>
-                {d.node || e.type}
-              </span>
-              {d.iteration != null && (
-                <span style={styles.badge}>iter {d.iteration}</span>
-              )}
-              {d.fix_attempts != null && d.fix_attempts > 0 && (
-                <span style={styles.badge}>fix#{d.fix_attempts}</span>
-              )}
-              {d.needs_fix === true && (
-                <span style={styles.badgeWarn}>needs_fix</span>
-              )}
-              {d.needs_fix === false && d.node === "security" && (
-                <span style={styles.badgeOk}>passed</span>
-              )}
-              {d.next_agent && (
-                <span style={styles.badgeNext}>→ {d.next_agent}</span>
+              <span style={styles.logTime}>{new Date(e.at).toLocaleTimeString()}</span>
+              <span style={styles.logNode}>{d.node || e.type}</span>
+              {d.iteration != null && <span style={styles.badge}>iter {d.iteration}</span>}
+              {d.fix_attempts > 0 && <span style={styles.badge}>fix#{d.fix_attempts}</span>}
+              {d.needs_fix === true && <span style={styles.badgeWarn}>needs_fix</span>}
+              {d.next_agent && <span style={styles.badgeNext}>→ {d.next_agent}</span>}
+              {d.file_count && (
+                <details style={{ marginLeft: 8 }}>
+                  <summary style={{ cursor: "pointer", color: "#94a3b8" }}>
+                    {d.file_count} files
+                  </summary>
+                  <ul style={{ margin: "4px 0 0 12px", padding: 0, listStyle: "none" }}>
+                    {d.file_paths.map((p) => (
+                      <li key={p} style={{ fontSize: 12, color: "#cbd5e1" }}>📄 {p}</li>
+                    ))}
+                  </ul>
+                </details>
               )}
             </div>
           );
