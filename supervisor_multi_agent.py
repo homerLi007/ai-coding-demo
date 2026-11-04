@@ -1024,26 +1024,41 @@ def github_commit_node(state: SupervisorState):
     if not token:
         raise ValueError("GITHUB_TOKEN 未设置")
 
-    # ── 1. 初始化客户端 + owner ──
     g = Github(auth=Auth.Token(token))
+    owner = (state.get("github_owner") or "").strip()
+    print(f"🎯 github_owner = {owner!r}")
 
-    # 优先用 org（你现在的 org 叫 homerli007-ai），否则退回 user
-    owner = state.get("github_owner") or "homerli007-ai"
-    try:
-        target_owner = g.get_organization(owner)
-        print(f"📦 使用 organization: {owner}")
-    except GithubException:
-        target_owner = g.get_user(owner)
-        print(f"📦 使用 user: {target_owner.login}")
+    # ── 1. 拿当前认证用户 ──
+    auth_user = g.get_user()   # ← 注意：不带参数 = AuthenticatedUser，有 create_repo
+    print(f"👤 当前认证用户: {auth_user.login}")
 
-    # ── 2. 生成唯一的 repo 名和 NodePort ──
+    # ── 2. 决定目标 owner 对象 ──
+    target_owner = None
+    if not owner or owner.lower() == auth_user.login.lower():
+        target_owner = auth_user
+        owner = auth_user.login
+        print(f"📦 将在 user 下创建: {owner}")
+    else:
+        try:
+            target_owner = g.get_organization(owner)
+            print(f"📦 将在 organization 下创建: {owner}")
+        except GithubException as e:
+            raise RuntimeError(
+                f"无法访问 organization '{owner}' (status={e.status})。"
+                f"请检查：① org 名是否正确（你的是 'homerli007-ai'）；"
+                f"② PAT 是否有 org 的写权限（Classic PAT 需勾 'repo' + 'admin:org'，"
+                f"Fine-grained PAT 需在 org 下创建并授予 'Administration: Read and write'）。"
+            )
+
+    # ── 3. 生成唯一 repo 名 + NodePort ──
+    import random
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     repo_name = f"generated-app-{ts}"
     nodeport = 30080 + random.randint(0, 2600)
     print(f"📦 新仓库: {owner}/{repo_name}")
     print(f"🔌 NodePort: {nodeport}")
 
-    # ── 3. 创建新 repo ──
+    # ── 4. 创建 repo ──
     try:
         new_repo = target_owner.create_repo(
             name=repo_name,
@@ -1053,7 +1068,9 @@ def github_commit_node(state: SupervisorState):
         )
         print(f"✅ Repo created: {new_repo.html_url}")
     except GithubException as e:
-        raise RuntimeError(f"创建仓库失败: {e.status} {e.data}")
+        raise RuntimeError(f"创建仓库失败: status={e.status}, data={e.data}")
+
+    # ... 下面保持原样（组装 files、create_file、返回 State） ...
 
     # ── 4. 组装要推送的文件 ──
     files = dict(state.get("files", {}) or {})
