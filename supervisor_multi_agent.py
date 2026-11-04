@@ -1074,8 +1074,10 @@ def github_commit_node(state: SupervisorState):
 
     # ── 4. 组装要推送的文件 ──
     files = dict(state.get("files", {}) or {})
-    files["README.md"] = state.get("documentation", "") or "# Generated App"
-    files["backend/Dockerfile"] = _gen_app_dockerfile()
+    for path, content in (state.get("files", {}) or {}).items():
+        files[f"/{path.lstrip('/')}"] = content
+    files["/README.md"] = state.get("documentation", "") or "# Generated App"
+    files["/backend/Dockerfile"] = _gen_app_dockerfile()
     files["k8s/deployment.yaml"] = _gen_app_deployment(repo_name, owner)
     files["k8s/service.yaml"] = _gen_app_service(repo_name, nodeport)
     files[".github/workflows/deploy.yml"] = _gen_app_workflow(repo_name, owner)
