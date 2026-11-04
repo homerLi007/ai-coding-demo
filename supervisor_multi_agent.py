@@ -888,7 +888,7 @@ def github_commit_node(state: SupervisorState):
         raise ValueError("GITHUB_TOKEN 未设置")
 
     g = Github(auth=Auth.Token(token))
-    user = g.get_user()
+    org = g.get_organization("homerli007-ai")
 
     # ── 1. 生成唯一的 repo 名和 NodePort ──
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -900,7 +900,7 @@ def github_commit_node(state: SupervisorState):
 
     # ── 2. 创建新 repo（空的，不要 auto_init）──
     try:
-        new_repo = user.create_repo(
+        new_repo = org.create_repo(
             name=repo_name,
             description=f"AI Agent generated: {state['task'][:100]}",
             private=False,
