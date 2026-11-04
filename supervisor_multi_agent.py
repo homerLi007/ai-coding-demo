@@ -1025,34 +1025,34 @@ def github_commit_node(state: SupervisorState):
         raise ValueError("GITHUB_TOKEN 未设置")
 
     g = Github(auth=Auth.Token(token))
-    owner = state.get("github_owner") or "homerli007-ai"
-    try:
-        target_owner = g.get_organization(owner)  # 使用组织对象
-    except GithubException:
-        target_owner = g.get_user(owner)
-        print(f"🎯 github_owner = {owner!r}")
+    owner = (state.get("github_owner") or "").strip()
+    print(f"🎯 github_owner = {owner!r}")
 
-    # ── 1. 拿当前认证用户 ──
-    auth_user = g.get_user()   # ← 注意：不带参数 = AuthenticatedUser，有 create_repo
+    auth_user = g.get_user()
     print(f"👤 当前认证用户: {auth_user.login}")
 
-    # ── 2. 决定目标 owner 对象 ──
+    # ── 决定目标 owner 对象（强制优先 org）──
     target_owner = None
-    if not owner or owner.lower() == auth_user.login.lower():
-        target_owner = auth_user
-        owner = auth_user.login
-        print(f"📦 将在 user 下创建: {owner}")
-    else:
+
+    # 1. 先试 org（如果 owner 不是当前用户本人）
+    if owner and owner.lower() != auth_user.login.lower():
         try:
             target_owner = g.get_organization(owner)
             print(f"📦 将在 organization 下创建: {owner}")
         except GithubException as e:
             raise RuntimeError(
-                f"无法访问 organization '{owner}' (status={e.status})。"
-                f"请检查：① org 名是否正确（你的是 'homerli007-ai'）；"
-                f"② PAT 是否有 org 的写权限（Classic PAT 需勾 'repo' + 'admin:org'，"
-                f"Fine-grained PAT 需在 org 下创建并授予 'Administration: Read and write'）。"
+                f"无法访问 organization '{owner}' (status={e.status})。\n"
+                f"请检查：\n"
+                f"  ① owner 是否正确（你的是 'homerli007-ai'，小写 + 连字符）；\n"
+                f"  ② PAT 是否有 org 写权限——Classic PAT 需勾 'repo' + 'admin:org'；\n"
+                f"  ③ 你是该 org 的成员且有创建 repo 的权限。"
             )
+    else:
+        # owner 是本人或为空 → 明确提醒，但不建议这么用
+        target_owner = auth_user
+        owner = auth_user.login
+        print(f"⚠️ 将在个人账户下创建: {owner}（org 级 runner 无法服务个人 repo，"
+              f"除非你在 org 或 repo 级另外注册了 runner）")
 
     # ── 3. 生成唯一 repo 名 + NodePort ──
     import random
