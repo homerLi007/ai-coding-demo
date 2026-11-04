@@ -1366,7 +1366,7 @@ if __name__ == "__main__":
         "documentation": "",
         "iteration_count": 0,       # ← 补上：supervisor 熔断依赖
         "github_owner": "homerli007-ai",
-        "github_repo": "ai-coding-demo",
+        "github_repo": "springbootapplication",
         "github_base_branch": "main",
         "github_code_path": "",
         "github_pr_url": "",
