@@ -1029,7 +1029,8 @@ def github_commit_node(state: SupervisorState):
     try:
         target_owner = g.get_organization(owner)  # 使用组织对象
     except GithubException:
-        target_owner = g.get_user(owner)     print(f"🎯 github_owner = {owner!r}")
+        target_owner = g.get_user(owner)
+        print(f"🎯 github_owner = {owner!r}")
 
     # ── 1. 拿当前认证用户 ──
     auth_user = g.get_user()   # ← 注意：不带参数 = AuthenticatedUser，有 create_repo
