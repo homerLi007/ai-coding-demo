@@ -7,8 +7,8 @@ export default function App() {
     "a list of file paths (refuse symlinks, refuse paths outside allowed_root, refuse " +
     "non-regular files), plus a React UI to call it."
   );
-  const [owner, setOwner] = useState("homerLi007");
-  const [repo, setRepo] = useState("ai-coding-demo");
+  const [owner, setOwner] = useState("homerli007-ai");
+  const [repo, setRepo] = useState("springbootapplication");
   const [branch, setBranch] = useState("main");
 
   const { run, cancel, running, events, prUrl, error, appUrl, repoUrl } = useAgentRun();
