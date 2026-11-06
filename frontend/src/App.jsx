@@ -11,7 +11,12 @@ export default function App() {
   const [repo, setRepo] = useState("springbootapplication");
   const [branch, setBranch] = useState("main");
 
-  const { run, cancel, running, events, prUrl, error, appUrl, repoUrl } = useAgentRun();
+  // ① 解构多拿 newTask / taskId / status
+  const {
+    run, cancel, newTask,
+    running, events, prUrl, error, appUrl, repoUrl,
+    taskId, status,
+  } = useAgentRun();
 
   const onSubmit = (e) => {
     e.preventDefault();
@@ -27,6 +32,12 @@ export default function App() {
   return (
     <div style={styles.page}>
       <h1 style={styles.h1}>🤖 Multi-Agent Runner</h1>
+
+      {/* ② 当前 task 状态条 */}
+      <div style={styles.taskBadge}>
+        当前任务: {taskId ? taskId.slice(0, 8) : "未创建"}
+        {status !== "idle" && <span style={styles.statusChip}>{status}</span>}
+      </div>
 
       {/* ─── 输入表单 ─── */}
       <form onSubmit={onSubmit} style={styles.form}>
@@ -75,6 +86,15 @@ export default function App() {
           <button type="submit" disabled={running} style={styles.btnPrimary}>
             {running ? "⏳ Running..." : "🚀 Run Agent"}
           </button>
+          {/* ③ 新任务按钮 */}
+          <button
+            type="button"
+            onClick={newTask}
+            disabled={running}
+            style={styles.btnSecondary}
+          >
+            🆕 New Task
+          </button>
           {running && (
             <button type="button" onClick={cancel} style={styles.btnDanger}>
               ✋ Cancel
@@ -96,7 +116,7 @@ export default function App() {
         </div>
       )}
 
-      {/* 👇👇👇 新增：新仓库链接 + 应用地址，紧跟在 {prUrl && ...} 之后 👇👇👇 */}
+      {/* 新仓库链接 + 应用地址 */}
       {repoUrl && (
         <div style={styles.successBox}>
           📦 新仓库：{" "}
@@ -124,7 +144,6 @@ export default function App() {
           </p>
         </div>
       )}
-      {/* 👆👆👆 新增结束 👆👆👆 */}
 
       {/* ─── 实时事件流 ─── */}
       <h2 style={styles.h2}>📡 实时进度（{events.length} 条）</h2>
@@ -185,6 +204,30 @@ const styles = {
   },
   h1: { fontSize: 22, marginBottom: 16 },
   h2: { fontSize: 16, marginTop: 24, marginBottom: 8 },
+  // ④ 新增 3 个样式
+  taskBadge: {
+    marginBottom: 16,
+    fontSize: 12,
+    color: "#64748b",
+    fontFamily: "ui-monospace, Menlo, Consolas, monospace",
+  },
+  statusChip: {
+    marginLeft: 8,
+    padding: "2px 8px",
+    borderRadius: 999,
+    background: "#e0e7ff",
+    color: "#3730a3",
+    fontSize: 11,
+  },
+  btnSecondary: {
+    padding: "10px 20px",
+    background: "#e5e7eb",
+    color: "#111",
+    border: "none",
+    borderRadius: 6,
+    cursor: "pointer",
+    fontSize: 14,
+  },
   form: { display: "grid", gap: 12 },
   row: { display: "flex", gap: 12 },
   label: { display: "flex", flexDirection: "column", gap: 4, flex: 1 },

@@ -1,0 +1,16 @@
+FROM mcr.microsoft.com/playwright:v1.49.0-jammy
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openjdk-17-jdk \
+        maven \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN java -version && mvn -v && node -v && npx playwright --version
+
+RUN useradd -m -u 65532 sandbox
+USER 65532:65532
+WORKDIR /workspace
+
+CMD ["bash"]

@@ -1,62 +1,40 @@
+import json
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
-from .models import RunRequest
-from .agent_runner import run_agent_stream
-
-app = FastAPI(title="Multi-Agent API", version="0.1.0")
-
-# 允许 React 开发服务器跨域
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:8080",       # ← 加这行，兼容 port-forward
-        "http://127.0.0.1:8080",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+from supervisor_multi_agent import workflow, create_checkpointer
+from backend.agent_runner import run_agent_stream
 
 
-@app.get("/api/health")
-def health():
-    return {"status": "ok"}
+_holder = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    checkpointer, pool = await create_checkpointer()
+    _holder["app"] = workflow.compile(checkpointer=checkpointer)
+    _holder["pool"] = pool
+    yield
+    await pool.close()
+
+
+app = FastAPI(lifespan=lifespan)          # ← 模块级
+
+
+class RunRequest(BaseModel):               # ← 模块级
+    task: str
+    task_id: str | None = None
 
 
 @app.post("/api/run")
-async def run(req: RunRequest):
-    """触发多智能体流程，以 SSE 流式返回进度。"""
-    return StreamingResponse(
-        run_agent_stream(req.model_dump()),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",   # 禁用 nginx 缓冲
-        },
-    )
+async def run_agent(body: RunRequest):
+    async def gen():
+        async for chunk in run_agent_stream(body.task, body.task_id):
+            event_type = chunk.get("type", "message")
+            payload = json.dumps(chunk, ensure_ascii=False)
+            yield f"event: {event_type}\ndata: {payload}\n\n"
 
-# ── 托管前端静态文件（仅在生产镜像中存在）──
-from pathlib import Path
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-
-FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
-if FRONTEND_DIST.exists():
-    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
-
-    @app.get("/")
-    def serve_index():
-        return FileResponse(FRONTEND_DIST / "index.html")
-
-    @app.get("/{path:path}")
-    def serve_spa(path: str):
-        # 让 SPA 路由回退到 index.html
-        file = FRONTEND_DIST / path
-        if file.is_file():
-            return FileResponse(file)
-        return FileResponse(FRONTEND_DIST / "index.html")
+    return StreamingResponse(gen(), media_type="text/event-stream")

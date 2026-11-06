@@ -1,70 +1,81 @@
-import json
-from typing import Any, AsyncGenerator, Dict
+import hashlib
+import uuid
+from typing import AsyncGenerator
 
-from supervisor_multi_agent import app as agent_app
+from supervisor_multi_agent import _derive_thread_id
 
 
-async def run_agent_stream(req: Dict[str, Any]) -> AsyncGenerator[str, None]:
-    """执行多智能体流程，以 SSE 格式流式返回每个节点的更新。"""
-    initial_inputs = {
-        "task": req["task"],
+def _build_initial_inputs(task: str) -> dict:
+    return {
+        "task": task,
         "messages": [],
         "next_agent": "",
         "code": "",
-        "files": {},                 # ← 新增：多文件项目
+        "files": {},
         "security_report": "",
         "needs_fix": False,
         "fix_attempts": 0,
         "documentation": "",
-        "github_owner": req["github_owner"],
-        "github_repo": req["github_repo"],
-        "github_base_branch": req.get("github_base_branch", "main"),
+        "iteration_count": 0,
+        "github_owner": "homerli007-ai",
+        "github_repo": "springbootapplication",
+        "github_base_branch": "main",
         "github_code_path": "",
         "github_pr_url": "",
-        "iteration_count": 0,
+        "test_report": "",
+        "test_passed": False,
+        "test_attempts": 0,
+        "e2e_report": "",
+        "e2e_passed": False,
+        "e2e_attempts": 0,
+        "generated_repo": "",
+        "generated_repo_url": "",
+        "app_url": "",
+        "app_nodeport": 0,
     }
 
-    try:
-        async for chunk in agent_app.astream(initial_inputs, stream_mode="updates"):
-            for node_name, update in chunk.items():
-                if not isinstance(update, dict):
-                    continue
 
-                # ── 1. 创建事件对象 ──
-                event: Dict[str, Any] = {"node": node_name}
+async def run_agent_stream(
+        task: str, task_id: str | None = None
+) -> AsyncGenerator[dict, None]:
+    # 延迟导入，避免与 main.py 循环导入
+    from backend.main import _holder
 
-                # ── 2. 逐个字段填充（这里就是你要加的位置，和其他 if 并列）──
-                if "iteration_count" in update:
-                    event["iteration"] = update["iteration_count"]
-                if "next_agent" in update:
-                    event["next_agent"] = update["next_agent"]
-                if "needs_fix" in update:
-                    event["needs_fix"] = update["needs_fix"]
-                if "fix_attempts" in update:
-                    event["fix_attempts"] = update["fix_attempts"]
+    # 1. 取 app（必须在任何使用 agent_app 之前）
+    agent_app = _holder.get("app")
+    if agent_app is None:
+        yield {"type": "error", "message": "agent app not initialized"}
+        return
 
-                if update.get("generated_repo_url"):
-                    event["generated_repo_url"] = update["generated_repo_url"]
-                if update.get("app_url"):
-                    event["app_url"] = update["app_url"]
-                if update.get("app_nodeport"):
-                    event["app_nodeport"] = update["app_nodeport"]
+    # 2. 派生 thread_id
+    if not task_id:
+        task_id = f"adhoc-{uuid.uuid4().hex[:12]}"
+    thread_id = _derive_thread_id(task_id)
+    config = {"configurable": {"thread_id": thread_id}}
 
-                # 👇👇👇 加在这里：紧跟在 fix_attempts 之后，github_pr_url 之前 👇👇👇
-                if "files" in update and update["files"]:
-                    event["file_count"] = len(update["files"])
-                    event["file_paths"] = sorted(update["files"].keys())
-                # 👆👆👆 加到这里 👆👆👆
+    # 3. 异步读取 checkpoint 状态（注意是 aget_state，不是 get_state）
+    snapshot = await agent_app.aget_state(config)
+    is_resume = bool(snapshot and snapshot.values)
+    inputs = {} if is_resume else _build_initial_inputs(task)
 
-                if update.get("github_pr_url"):
-                    event["pr_url"] = update["github_pr_url"]
-                    event["final"] = True
+    yield {
+        "type": "meta",
+        "task_id": task_id,
+        "thread_id": thread_id,
+        "mode": "resume" if is_resume else "new",
+    }
 
-                # ── 3. 发送 SSE 事件 ──
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+    # 4. 异步流式执行
+    async for event in agent_app.astream(inputs, config=config, stream_mode="values"):
+        yield {
+            "type": "state",
+            "next_agent": event.get("next_agent"),
+            "iteration": event.get("iteration_count"),
+            "has_files": bool(event.get("files")),
+            "test_passed": event.get("test_passed"),
+            "e2e_passed": event.get("e2e_passed"),
+            "app_url": event.get("app_url"),
+            "github_pr_url": event.get("github_pr_url"),
+        }
 
-        yield "event: done\ndata: {}\n\n"
-
-    except Exception as e:
-        error_event = {"type": type(e).__name__, "message": str(e)}
-        yield f"event: error\ndata: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+    yield {"type": "done", "thread_id": thread_id}

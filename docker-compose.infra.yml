@@ -1,0 +1,37 @@
+# docker-compose.infra.yml
+services:
+  postgres:
+    image: postgres:16
+    container_name: langgraph-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: langgraph_db
+      POSTGRES_USER: langgraph_user
+      POSTGRES_PASSWORD: "123456"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langgraph_user -d langgraph_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  executor:
+    image: executor-service:latest
+    container_name: executor
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    volumes:
+      # WSL / Linux 环境
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      MAX_CONCURRENT: "4"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

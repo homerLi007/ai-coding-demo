@@ -1,5 +1,10 @@
 const API_BASE = "";
 
+function newTaskId() {
+  if (crypto?.randomUUID) return crypto.randomUUID()
+  return 'task-' + Date.now() + '-' + Math.random().toString(16).slice(2)
+}
+
 /**
  * 消费后端 SSE 流。
  *
@@ -9,10 +14,19 @@ const API_BASE = "";
  *   event: error\ndata: {"message": "..."}\n\n
  */
 export async function runAgentStream(params, onEvent, signal) {
+   // 1. 取或生成 task_id
+   let taskId =
+      params.task_id ||
+      sessionStorage.getItem("current_task_id") ||
+      newTaskId();
+    sessionStorage.setItem("current_task_id", taskId);
+
+  const payload = { ...params, task_id: taskId };
+
   const response = await fetch(`${API_BASE}/api/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(params),
+    body: JSON.stringify(payload),
     signal,
   });
 

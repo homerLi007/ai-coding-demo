@@ -1,6 +1,4 @@
 import os
-import json
-import re
 from typing import Annotated, TypedDict, Sequence, Literal
 import operator
 from datetime import datetime
@@ -10,10 +8,19 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from dotenv import load_dotenv
 from github import Github, Auth, GithubException
-import subprocess
-import tempfile
-import time
 import socket
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg_pool import AsyncConnectionPool
+from psycopg.rows import dict_row
+import hashlib
+from pydantic import BaseModel, Field, field_validator
+from typing import Literal
+from enum import Enum
+import re
+from pydantic import ValidationError
+from langchain_core.messages import HumanMessage, AIMessage
+import selectors
+from backend.executor_client import run_sync, run_stream
 
 load_dotenv()
 
@@ -51,114 +58,55 @@ def _write_files_to_dir(files: dict, base_dir: str, prefix: str) -> None:
         with open(full, "w", encoding="utf-8") as f:
             f.write(content or "")
 
-
-def _run_mvn_test(files: dict, timeout: int = 300) -> tuple[bool, str]:
-    """在临时目录里跑 `mvn test`，返回 (passed, output)"""
-    if not any(p.startswith("backend/") for p in files):
-        return False, "no backend/ files to test"
-    with tempfile.TemporaryDirectory() as tmp:
-        backend = os.path.join(tmp, "backend")
-        os.makedirs(backend)
-        _write_files_to_dir(files, backend, "backend/")
-        try:
-            r = subprocess.run(
-                ["mvn", "test", "-B", "-q"],
-                cwd=backend, capture_output=True, text=True, timeout=timeout,
-            )
-            return r.returncode == 0, (r.stdout or "") + "\n" + (r.stderr or "")
-        except subprocess.TimeoutExpired:
-            return False, f"mvn test timed out after {timeout}s"
-        except FileNotFoundError:
-            return False, "mvn not found in PATH (check Dockerfile)"
-        except Exception as e:
-            return False, f"mvn test failed: {e}"
-
-
-def _run_e2e(files: dict, e2e_files: dict, timeout: int = 300) -> tuple[bool, str]:
-    """启动 Spring Boot + React，跑 Playwright，返回 (passed, output)"""
-    backend_proc = None
-    frontend_proc = None
-    with tempfile.TemporaryDirectory() as tmp:
-        backend = os.path.join(tmp, "backend")
-        frontend = os.path.join(tmp, "frontend")
-        e2e_dir = os.path.join(tmp, "e2e")
-        for d in (backend, frontend, e2e_dir):
-            os.makedirs(d)
-        _write_files_to_dir(files, backend, "backend/")
-        _write_files_to_dir(files, frontend, "frontend/")
-        _write_files_to_dir(e2e_files, e2e_dir, "e2e/")
-
-        try:
-            # 1. 编译后端
-            r = subprocess.run(
-                ["mvn", "package", "-DskipTests", "-B", "-q"],
-                cwd=backend, capture_output=True, text=True, timeout=180,
-            )
-            if r.returncode != 0:
-                return False, "mvn package failed:\n" + r.stdout + r.stderr
-
-            # 2. 启动后端
-            target = os.path.join(backend, "target")
-            jars = [f for f in os.listdir(target)
-                    if f.endswith(".jar") and "sources" not in f and "original" not in f]
-            if not jars:
-                return False, "no jar found in target/"
-            backend_proc = subprocess.Popen(
-                ["java", "-jar", os.path.join(target, jars[0])],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            )
-            if not _port_ready("localhost", 8080, timeout=90):
-                return False, "backend did not start within 90s"
-
-            # 3. 安装前端依赖
-            r = subprocess.run(
-                ["npm", "install", "--registry=https://registry.npmmirror.com"],
-                cwd=frontend, capture_output=True, text=True, timeout=180,
-            )
-            if r.returncode != 0:
-                return False, "npm install failed:\n" + r.stdout + r.stderr
-
-            # 4. 启动前端
-            frontend_proc = subprocess.Popen(
-                ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5173"],
-                cwd=frontend,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            )
-            if not _port_ready("localhost", 5173, timeout=90):
-                return False, "frontend did not start within 90s"
-
-            # 5. 安装 e2e 依赖 + 跑 Playwright
-            r = subprocess.run(
-                ["npm", "install", "--registry=https://registry.npmmirror.com"],
-                cwd=e2e_dir, capture_output=True, text=True, timeout=180,
-            )
-            if r.returncode != 0:
-                return False, "e2e npm install failed:\n" + r.stdout + r.stderr
-
-            r = subprocess.run(
-                ["npx", "playwright", "test", "--reporter=line"],
-                cwd=e2e_dir, capture_output=True, text=True, timeout=timeout,
-                env={**os.environ, "BASE_URL": "http://localhost:5173"},
-            )
-            return r.returncode == 0, (r.stdout or "") + "\n" + (r.stderr or "")
-        except subprocess.TimeoutExpired as e:
-            return False, f"e2e timed out: {e}"
-        except Exception as e:
-            return False, f"e2e failed: {e}"
-        finally:
-            for proc in (backend_proc, frontend_proc):
-                if proc and proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-
 # 无扩展名但合法、必须保留原名的文件
 _NO_EXT_WHITELIST = {
     "dockerfile", "makefile", ".gitignore", ".dockerignore",
     ".npmrc", ".env.example", ".editorconfig",
 }
+
+def invoke_with_schema(
+        llm_client, prompt: str, schema: type[BaseModel], max_retries: int = 3
+):
+    messages = [HumanMessage(content=prompt)]
+
+    for attempt in range(max_retries):
+        print(f"\n[invoke_with_schema] attempt {attempt + 1}/{max_retries}, "
+              f"schema={schema.__name__}, messages_len={len(messages)}")
+        response = llm_client.invoke(messages)
+        raw = response.content.strip()
+
+        print(f"[invoke_with_schema] raw output (first 300 chars):\n{raw[:300]}")
+        # Strip possible markdown fences
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+
+        try:
+            result = schema.model_validate_json(raw)
+            print(f"[invoke_with_schema] ✅ validation PASSED on attempt {attempt + 1}")
+            return result
+        except ValidationError as e:
+            print(f"[invoke_with_schema] ❌ validation FAILED on attempt {attempt + 1}")
+            print(f"[invoke_with_schema] error_count={e.error_count()}")
+            print(f"[invoke_with_schema] errors:\n{e.json(indent=2)}")
+
+            if attempt == max_retries - 1:
+                print("[invoke_with_schema] 🚨 exhausted retries, raising")
+                raise
+
+            # Feed structured validation errors back to the model
+            error_feedback = (
+                "The previous output failed schema validation. "
+                "Fix the errors below and return ONLY valid JSON "
+                "(no markdown fences):\n"
+                f"{e.json(indent=2)}"
+            )
+
+            # Keep the model's last output in the conversation
+            messages.append(AIMessage(content=response.content))
+            messages.append(HumanMessage(content=error_feedback))
+
+    raise RuntimeError("invoke_with_schema: exhausted retries")
 
 def _check_hard_constraints(files: dict) -> str | None:
     """静态检查生成的项目是否违反 HARD CONSTRAINTS。
@@ -391,6 +339,46 @@ class SupervisorState(TypedDict):
     app_url: str               # http://172.30.95.100:31234/
     app_nodeport: int          # 分配的 NodePort
 
+class CoderOutput(BaseModel):
+    files: dict[str, str] = Field(
+        ...,
+        min_length=1,
+        description="Mapping from relative file path (e.g. 'backend/pom.xml') to file content. At least one file is required.",
+    )
+    changes: str = Field(
+        default="",
+        max_length=500,
+        description="One-sentence summary of what was changed. Max 500 characters.",
+    )
+    notes: str = Field(
+        default="",
+        description="Optional known limitations or notes for the reviewer.",
+    )
+
+    @field_validator("files")
+    @classmethod
+    def files_must_not_be_empty(cls, v: dict[str, str]) -> dict[str, str]:
+        if not v:
+            raise ValueError("files must not be empty; at least one file is required.")
+        return v
+
+class Severity(str, Enum):
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
+
+class TesterOutput(BaseModel):
+    files: dict[str, str] = Field(
+        ...,
+        min_length=1,
+        description="Mapping from test file path (e.g. 'backend/src/test/java/com/example/demo/ApiControllerTest.java') to test source code.",
+    )
+    notes: str = Field(
+        default="",
+        description="Optional notes about test coverage or assumptions.",
+    )
 
 def _extract_top_issues(report: str, max_issues: int = 3) -> list[str]:
     """只提取 CRITICAL / HIGH 级别的 [FIXABLE] 条目。"""
@@ -452,29 +440,17 @@ def coder_node(state: SupervisorState):
             issues_block = "\n\n".join(issues) if issues else feedback[:3000]
             files_block = _format_files_for_prompt(previous_files)
 
-            prompt = FIX_PROMPT.format(
-                task=task, files_block=files_block, issues_block=issues_block
-            )
-            response = llm_fix.invoke([HumanMessage(content=prompt)])
+            prompt = FIX_PROMPT.format(task=task, files_block=files_block, issues_block=issues_block)
+            result = invoke_with_schema(llm_fix, prompt, CoderOutput, max_retries=3)
+            raw_files = result.files
+            changes = result.changes
+            notes = result.notes
         else:
             prompt = INITIAL_PROMPT.format(task=task)
-            response = llm.invoke([HumanMessage(content=prompt)])
-
-        content = response.content.strip()
-        if content.startswith("```"):
-            content = re.sub(r"^```(?:json)?\s*", "", content)
-            content = re.sub(r"\s*```$", "", content)
-
-        try:
-            payload = json.loads(content)
-            raw_files = payload.get("files", {})
-            changes = payload.get("changes", "")
-            notes = payload.get("notes", "")
-        except json.JSONDecodeError:
-            print("⚠️ Coder 未返回合法 JSON，兜底为单文件 README.md")
-            raw_files = {"README.md": content}
-            changes = "(fallback)"
-            notes = ""
+            result = invoke_with_schema(llm, prompt, CoderOutput, max_retries=3)
+            raw_files = result.files
+            changes = result.changes
+            notes = result.notes
 
         cleaned: dict[str, str] = {}
         for raw_path, file_content in raw_files.items():
@@ -709,34 +685,7 @@ def supervisor_node(state: SupervisorState):
     print(f"🎯 Supervisor Decision -> Next Worker: {next_agent}")
     return {"next_agent": next_agent, "iteration_count": iteration}
 
-
-def _gen_app_dockerfile() -> str:
-    return """\
-FROM node:20-alpine AS fe
-WORKDIR /fe
-RUN npm config set registry https://registry.npmmirror.com
-COPY frontend/package*.json ./
-RUN npm ci || npm install
-COPY frontend/ ./
-RUN npm run build
-
-FROM maven:3.9-eclipse-temurin-17 AS be
-WORKDIR /app
-COPY backend/pom.xml .
-RUN mvn dependency:go-offline -B || true
-COPY backend/src ./src
-COPY --from=fe /fe/dist ./src/main/resources/static/
-RUN mvn package -DskipTests -B
-
-FROM eclipse-temurin:17-jre
-WORKDIR /app
-COPY --from=be /app/target/*.jar app.jar
-EXPOSE 8080
-CMD ["java", "-jar", "app.jar"]
-"""
-
-
-def _gen_app_deployment(repo_name: str) -> str:
+def _gen_app_deployment(repo_name: str, owner: str) -> str:
     return f"""\
 apiVersion: apps/v1
 kind: Deployment
@@ -791,7 +740,7 @@ spec:
 """
 
 
-def _gen_app_workflow(repo_name: str) -> str:
+def _gen_app_workflow(repo_name: str, owner: str) -> str:
     return f"""\
 name: Build and Deploy
 
@@ -908,116 +857,6 @@ EXPOSE 8080
 CMD ["java", "-jar", "app.jar"]
 """
 
-
-def _gen_app_deployment(repo_name: str, owner: str) -> str:
-    return f"""\
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {repo_name}
-  namespace: default
-  labels:
-    app: {repo_name}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: {repo_name}
-  template:
-    metadata:
-      labels:
-        app: {repo_name}
-    spec:
-      containers:
-        - name: app
-          image: ghcr.io/{owner}/{repo_name}:latest
-          imagePullPolicy: Always
-          ports:
-            - containerPort: 8080
-          resources:
-            requests:
-              cpu: "200m"
-              memory: "512Mi"
-            limits:
-              cpu: "1000m"
-              memory: "1Gi"
-      imagePullSecrets:
-        - name: ghcr-secret
-"""
-
-
-def _gen_app_service(repo_name: str, nodeport: int) -> str:
-    return f"""\
-apiVersion: v1
-kind: Service
-metadata:
-  name: {repo_name}-service
-  namespace: default
-spec:
-  selector:
-    app: {repo_name}
-  ports:
-    - port: 80
-      targetPort: 8080
-      nodePort: {nodeport}
-  type: NodePort
-"""
-
-
-def _gen_app_workflow(repo_name: str, owner: str) -> str:
-    return f"""\
-name: Build and Deploy
-
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: {owner}/{repo_name.lower()}
-  KUBECONFIG: /home/forrestli/.kube/config
-
-jobs:
-  deploy:
-    runs-on: [self-hosted, k3s, local]
-
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout
-        run: |
-          cd "$GITHUB_WORKSPACE"
-          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {{}} + 2>/dev/null || true
-          git clone --depth 1 "git@github.com:${{GITHUB_REPOSITORY}}.git" .
-          git fetch --depth 1 origin "${{GITHUB_SHA}}"
-          git checkout "${{GITHUB_SHA}}"
-
-      - name: Log in to GHCR
-        run: |
-          echo "${{{{ secrets.GITHUB_TOKEN }}}}" | \\
-            docker login "$REGISTRY" -u "${{{{ github.actor }}}}" --password-stdin
-
-      - name: Build and push image
-        run: |
-          IMG="${{REGISTRY}}/${{IMAGE_NAME}}:${{GITHUB_SHA}}"
-          IMG_LATEST="${{REGISTRY}}/${{IMAGE_NAME}}:latest"
-          docker build -f backend/Dockerfile -t "$IMG" -t "$IMG_LATEST" .
-          docker push "$IMG"
-          docker push "$IMG_LATEST"
-
-      - name: Deploy to K3s
-        run: |
-          IMG="${{REGISTRY}}/${{IMAGE_NAME}}:${{GITHUB_SHA}}"
-          sed -i "s|image:.*|image: ${{IMG}}|" k8s/deployment.yaml
-          kubectl apply -f k8s/
-          kubectl rollout status deployment/{repo_name} -n default --timeout=300s
-          kubectl get svc {repo_name}-service -n default
-"""
-
-
 def github_commit_node(state: SupervisorState):
     print("\n🐙 [GitHub Agent]: 创建新仓库并推送生成的项目...")
     token = os.environ.get("GITHUB_TOKEN")
@@ -1132,7 +971,7 @@ Return JSON:
 """
 
 
-def tester_node(state: SupervisorState):
+async def tester_node(state: SupervisorState):
     print("\n🧪 [Tester Agent]: Generating JUnit tests...")
     files = state.get("files", {}) or {}
     attempts = state.get("test_attempts", 0) + 1
@@ -1150,21 +989,15 @@ def tester_node(state: SupervisorState):
         prompt = TESTER_PROMPT.format(
             backend_files=_format_files_for_prompt(backend_files, max_chars=10000)
         )
-        response = llm.invoke([HumanMessage(content=prompt)])
-        content = response.content.strip()
-        if content.startswith("```"):
-            content = re.sub(r"^```(?:json)?\s*", "", content)
-            content = re.sub(r"\s*```$", "", content)
-
         try:
-            payload = json.loads(content)
-            test_files = payload.get("files", {})
-        except json.JSONDecodeError:
+            result = invoke_with_schema(llm, prompt, TesterOutput, max_retries=3)
+            test_files = result.files
+        except Exception as e:
             return {
-                "test_report": "LLM failed to return valid JSON for tests",
+                "test_report": f"LLM failed to produce valid test files: {e}",
                 "test_passed": False,
                 "test_attempts": attempts,
-                "messages": [AIMessage(content="Tester: JSON parse failed")],
+                "messages": [AIMessage(content="Tester: schema validation failed")],
             }
 
         # 清洗测试文件路径
@@ -1178,7 +1011,12 @@ def tester_node(state: SupervisorState):
         all_files = {**files, **cleaned}
 
         print("⏳ 运行 mvn test...")
-        passed, output = _run_mvn_test(all_files, timeout=300)
+        passed, output = await run_sync(
+            ["mvn", "test", "-B", "-q"],
+            {k: v for k, v in all_files.items() if k.startswith("backend/")},
+            workdir="/workspace/backend",
+            network_disabled=True,
+        )
 
         # 只保留输出末尾 3000 字符，避免 state 太大
         report = f"=== mvn test ({'PASSED' if passed else 'FAILED'}) ===\n{output[-3000:]}"
@@ -1198,6 +1036,14 @@ def tester_node(state: SupervisorState):
             "test_attempts": attempts,
             "messages": [AIMessage(content=f"Tester error: {e}")],
         }
+
+class E2eOutput(BaseModel):
+    files: dict[str, str] = Field(
+        ...,
+        min_length=1,
+        description="Mapping from e2e file path (e.g. 'e2e/tests/app.spec.js') to file content.",
+    )
+    notes: str = Field(default="", description="Optional notes.")
 
 E2E_PROMPT = """Generate Playwright tests that click through the React UI.
 
@@ -1227,7 +1073,7 @@ Return JSON:
 """
 
 
-def e2e_tester_node(state: SupervisorState):
+async def e2e_tester_node(state: SupervisorState):
     print("\n🌐 [E2E Tester]: Generating Playwright tests...")
     files = state.get("files", {}) or {}
     attempts = state.get("e2e_attempts", 0) + 1
@@ -1248,22 +1094,8 @@ def e2e_tester_node(state: SupervisorState):
             frontend_files=_format_files_for_prompt(frontend_files, max_chars=6000),
             backend_files=_format_files_for_prompt(backend_files, max_chars=4000),
         )
-        response = llm.invoke([HumanMessage(content=prompt)])
-        content = response.content.strip()
-        if content.startswith("```"):
-            content = re.sub(r"^```(?:json)?\s*", "", content)
-            content = re.sub(r"\s*```$", "", content)
-
-        try:
-            payload = json.loads(content)
-            e2e_files = payload.get("files", {})
-        except json.JSONDecodeError:
-            return {
-                "e2e_report": "LLM failed to return valid JSON for e2e tests",
-                "e2e_passed": False,
-                "e2e_attempts": attempts,
-                "messages": [AIMessage(content="E2E: JSON parse failed")],
-            }
+        result = invoke_with_schema(llm, prompt, E2eOutput, max_retries=3)
+        e2e_files = result.files
 
         cleaned = {}
         for p, c in e2e_files.items():
@@ -1271,7 +1103,20 @@ def e2e_tester_node(state: SupervisorState):
                 cleaned[sanitize_filename(p)] = c
 
         print(f"📄 生成 {len(cleaned)} 个 E2E 文件，启动服务中...")
-        passed, output = _run_e2e(files, cleaned, timeout=300)
+        passed, output = await run_stream(
+            ["bash", "-lc",
+             "cd /workspace/backend && mvn package -DskipTests -B -q && echo BACKEND_BUILD_OK && "
+             "java -jar target/*.jar > /tmp/backend.log 2>&1 & "
+             "cd /workspace/frontend && npm install --registry=https://registry.npmmirror.com > /tmp/npm-fe.log 2>&1 && "
+             "npm run dev -- --host 0.0.0.0 --port 5173 > /tmp/fe.log 2>&1 & "
+             "sleep 30 && "
+             "cd /workspace/e2e && npm install --registry=https://registry.npmmirror.com > /tmp/npm-e2e.log 2>&1 && "
+             "BASE_URL=http://localhost:5173 npx playwright test --reporter=line"],
+            {**files, **cleaned},
+            workdir="/workspace",
+            timeout=600,
+            network_disabled=False,
+        )
 
         report = f"=== Playwright ({'PASSED' if passed else 'FAILED'}) ===\n{output[-3000:]}"
         print(f"🌐 E2E result: {'PASSED' if passed else 'FAILED'}")
@@ -1339,55 +1184,99 @@ workflow.add_conditional_edges(
     },
 )
 
-app = workflow.compile()
 
 
-# ==========================================
-# 7. Run the Supervisor Multi-Agent System
-# ==========================================
+
+
+def _derive_thread_id(task_id: str) -> str:
+    """确定性派生：同一个 task_id 永远得到同一个 thread_id。"""
+    return hashlib.sha256(task_id.encode()).hexdigest()[:32]
+
+
+DB_URI = os.environ.get(
+    "CHECKPOINT_DB_URI",
+    "postgresql://langgraph_user:123456@localhost:5432/langgraph_db",
+)
+
+async def create_checkpointer() -> tuple[AsyncPostgresSaver, AsyncConnectionPool]:
+    pool = AsyncConnectionPool(
+        DB_URI,
+        min_size=2,
+        max_size=10,
+        kwargs={"autocommit": True, "row_factory": dict_row},
+        open=False,
+    )
+    await pool.open(wait=True, timeout=30)
+
+    checkpointer = AsyncPostgresSaver(pool)
+    await checkpointer.setup()          # 异步 setup，必须 await
+    return checkpointer, pool
+
 if __name__ == "__main__":
-    print("🚀 Supervisor Multi-Agent System Started...")
+    import asyncio
+    import sys
 
-    initial_inputs = {
-        "task": (
-            "Create a Spring Boot 3 + React 18 project: a REST endpoint that "
-            "takes a list of file paths and safely deletes them "
-            "(refuse symlinks, refuse paths outside allowed_root, refuse "
-            "non-regular files), plus a React UI to call it. "
-            "EXPLICIT NON-GOALS (do not report as findings): TOCTOU, "
-            "Windows ADS, 8.3 names, hard links, secure erasure, permission "
-            "enforcement."
-        ),
-        "messages": [],
-        "next_agent": "",
-        "code": "",
-        "files": {},                # ← 补上：多文件字典
-        "security_report": "",
-        "needs_fix": False,
-        "fix_attempts": 0,
-        "documentation": "",
-        "iteration_count": 0,       # ← 补上：supervisor 熔断依赖
-        "github_owner": "homerli007-ai",
-        "github_repo": "springbootapplication",
-        "github_base_branch": "main",
-        "github_code_path": "",
-        "github_pr_url": "",
-        "test_report": "",
-        "test_passed": False,
-        "test_attempts": 0,
-        "e2e_report": "",
-        "e2e_passed": False,
-        "e2e_attempts": 0,
-        "generated_repo": "",
-        "generated_repo_url": "",
-        "app_url": "",
-        "app_nodeport": 0,
-    }
+    async def _main():
+        print("🚀 Supervisor Multi-Agent System Started...")
+        task_id = sys.argv[1] if len(sys.argv) > 1 else "dev-task-001"
+        thread_id = _derive_thread_id(task_id)
+        config = {"configurable": {"thread_id": thread_id}}
 
-    for event in app.stream(initial_inputs, stream_mode="values"):
-        pass
+        checkpointer, pool = await create_checkpointer()
+        app = workflow.compile(checkpointer=checkpointer)
 
-    print("\n✨ Supervisor Workflow Finished Successfully!")
+        initial_inputs = {
+            "task": (
+                "Create a Spring Boot 3 + React 18 project: a REST endpoint that "
+                "takes a list of file paths and safely deletes them "
+                "(refuse symlinks, refuse paths outside allowed_root, refuse "
+                "non-regular files), plus a React UI to call it. "
+                "EXPLICIT NON-GOALS (do not report as findings): TOCTOU, "
+                "Windows ADS, 8.3 names, hard links, secure erasure, permission "
+                "enforcement."
+            ),
+            "messages": [],
+            "next_agent": "",
+            "code": "",
+            "files": {},
+            "security_report": "",
+            "needs_fix": False,
+            "fix_attempts": 0,
+            "documentation": "",
+            "iteration_count": 0,
+            "github_owner": "homerli007-ai",
+            "github_repo": "springbootapplication",
+            "github_base_branch": "main",
+            "github_code_path": "",
+            "github_pr_url": "",
+            "test_report": "",
+            "test_passed": False,
+            "test_attempts": 0,
+            "e2e_report": "",
+            "e2e_passed": False,
+            "e2e_attempts": 0,
+            "generated_repo": "",
+            "generated_repo_url": "",
+            "app_url": "",
+            "app_nodeport": 0,
+        }
+
+        snapshot = await app.aget_state(config)      # ← 异步
+        is_resume = bool(snapshot and snapshot.values)
+        inputs = {} if is_resume else initial_inputs
+        print(f"🧵 task_id={task_id} thread_id={thread_id} "
+              f"{'RESUME' if is_resume else 'NEW'}")
+
+        async for _ in app.astream(inputs, config=config, stream_mode="values"):
+            pass
+
+        await pool.close()
+        print("\n✨ Supervisor Workflow Finished Successfully!")
+
+    asyncio.run(
+        _main(),
+        loop_factory=lambda: asyncio.SelectorEventLoop(selectors.SelectSelector()),
+    )
 
 
-__all__ = ["app", "workflow", "SupervisorState"]
+__all__ = ["workflow", "SupervisorState", "_derive_thread_id", "create_checkpointer"]
